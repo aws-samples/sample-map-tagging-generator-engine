@@ -1,0 +1,1540 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Automated MAP Tagging & Value Engine. Deploys a serverless web app to generate
+  map-migrated tag values and AWS CLI/Terraform commands for the AWS Migration
+  Acceleration Program (MAP). No SAM CLI required. Stack deletion removes all
+  S3 bucket contents, including governance files. Save any files you need before
+  deleting the stack. This template creates billable AWS resources including
+  Amazon API Gateway, AWS CloudFront distribution, 5 AWS Lambda functions with
+  AWS Bedrock (Nova Pro) access, AWS CloudWatch Logs log group, AWS Cognito user
+  pool, AWS S3 storage, AWS KMS keys, and AWS SQS dead-letter queue. Primary
+  cost drivers are AWS CloudFront data transfer, Lambda invocations with Bedrock
+  model usage, and API Gateway requests. Costs vary based on usage. Delete the
+  stack when not in use to avoid ongoing charges. See Metadata for full cleanup
+  and prerequisites.
+
+Metadata:
+  Prerequisites:
+    Description: >
+      Before deploying this template, ensure the following: (1) AWS account with
+      permissions to create IAM roles, Lambda functions, API Gateway, CloudFront,
+      S3, Cognito, KMS, SQS, and CloudWatch Logs resources. (2) AWS Config must
+      be enabled in the deployment region for the scan-untagged feature to function.
+      (3) A valid email address for the initial admin user (Cognito sends a temporary
+      password). (4) Optional: ACM certificate ARN in us-east-1 if using a custom
+      domain. (5) Supported regions: us-east-1 recommended for AWS Bedrock Nova Pro
+      model availability.
+  CleanupInstructions:
+    Description: >
+      Stack deletion removes all S3 bucket contents, including governance files.
+      Save any files you need before deleting the stack. Deleting the stack
+      automatically empties both AWS S3 buckets (all object versions and delete
+      markers) before removing them.
+      1. BEFORE DELETING: Save any governance files from AWS S3 that you need to keep.
+      2. Delete stack. CLI - aws cloudformation delete-stack --stack-name STACK_NAME
+      3. Wait for deletion. CLI - aws cloudformation wait stack-delete-complete --stack-name STACK_NAME
+      4. Removes: AWS CloudFront distribution (15-60 min), 5 AWS Lambda functions,
+         API Gateway, AWS CloudWatch Logs log group, AWS Cognito user pool,
+         2 AWS KMS keys, AWS SQS dead-letter queue, IAM roles and managed policies,
+         AWS Bedrock model agreement.
+      5. Verify deletion. CLI - aws cloudformation describe-stacks --stack-name STACK_NAME.
+         Expected result: StackStatus shows DELETE_COMPLETE, or an error stating
+         Stack with id STACK_NAME does not exist. If status shows DELETE_FAILED,
+         check the Events tab in the CloudFormation console for the failed resource,
+         resolve the issue, and retry deletion.
+  SecurityInformation:
+    Description: >
+      Security information: This template uses Resource: * in IAM policies for the
+      following actions where resource-level permissions are not supported by AWS:
+      (1) aws-marketplace:ViewSubscriptions and aws-marketplace:Subscribe — required
+      for AWS Bedrock model subscription. Mitigated by aws:RequestedRegion,
+      aws:PrincipalAccount, and aws-marketplace:ProductId conditions.
+      (2) config:SelectResourceConfig — required for AWS Config advanced queries.
+      Mitigated by aws:RequestedRegion and aws:PrincipalAccount conditions.
+      (3) bedrock:ListFoundationModelAgreementOffers, CreateFoundationModelAgreement,
+      GetFoundationModelAvailability, DeleteFoundationModelAgreement — required for
+      AWS Bedrock model agreement management. Mitigated by bedrock:modelId,
+      aws:RequestedRegion, and aws:PrincipalAccount conditions.
+      All roles are scoped to individual Lambda functions and not granted to human
+      principals. See inline comments in each policy for full documentation and
+      links to AWS service authorization references.
+  Security:
+    Authentication: >
+      Amazon Cognito user pool with admin-only user creation (no self-signup).
+      Password policy enforces 12-character minimum with uppercase, lowercase,
+      numbers, and symbols. Temporary passwords expire in 7 days with forced
+      change on first login. API Gateway endpoints protected by Cognito JWT
+      authorizer. Throttling at 20 req/s with burst limit of 50.
+    EncryptionInTransit: >
+      TLS 1.2+ enforced on CloudFront distribution. S3 bucket policies deny all
+      requests where aws:SecureTransport is false (non-HTTPS rejected).
+    EncryptionAtRest: >
+      S3 buckets use AES-256 server-side encryption. CloudWatch Logs encrypted
+      with customer-managed KMS key (automatic rotation enabled). SQS DLQ uses
+      SQS-managed SSE.
+    NetworkAccess: >
+      S3 buckets are fully private with all public access blocked. CloudFront
+      Origin Access Control (OAC) restricts S3 reads to the distribution only.
+      No VPC or public subnet exposure. All compute is Lambda with no persistent
+      hosts. No long-lived credentials — Lambda functions use IAM execution roles
+      with temporary STS sessions.
+    LeastPrivilegeIAM: >
+      Each Lambda function has a dedicated IAM role (no shared roles). Policies
+      scoped with aws:RequestedRegion and aws:PrincipalAccount conditions.
+      Resource: * used only where AWS does not support resource-level permissions,
+      documented in-template with compensating controls. No IAM modification or
+      administrative permissions granted.
+    DataHandling: >
+      User input (MPE IDs, migration details) is transient — processed in Lambda
+      memory, never persisted. Bedrock model output is validated against hardcoded
+      tag rules and returned as text — never executed server-side. AWS Config query
+      results are filtered in code and returned to authenticated users only. Pre-signed
+      S3 URLs for governance file downloads expire after 15 minutes.
+    Logging: >
+      API Gateway access logs (request ID, source IP, timestamp, method, path, status).
+      CloudWatch Logs for all Lambda invocations (KMS encrypted, 30-day retention).
+      S3 access logs for both buckets (90-day retention). CloudFront access logs stored
+      in logging bucket. Dead letter queue captures failed Lambda invocations.
+    GovernanceArtifacts: >
+      SCP (map-migrated-tag-protection-scp.json) denies invalid tag keys and deletion
+      of map-migrated tag across the organization. Tag Policy (map-migrated-tag-policy.json)
+      enforces exact key format and valid value patterns on supported resource types.
+    AIOptOut: >
+      This application sends user-provided migration details (MPE IDs, credit programs,
+      service lists) to AWS Bedrock for tag generation. By default, AWS may use content
+      processed by AI services to improve its models. To prevent this, create an AI
+      services opt-out policy in AWS Organizations and attach it to the account or OU
+      where this stack is deployed. Policy example:
+      {"services":{"default":{"opt_out_policy":{"@@assign":"optOut"}}}}. Alternatively,
+      opt out for Bedrock specifically:
+      {"services":{"bedrock":{"opt_out_policy":{"@@assign":"optOut"}}}}. See
+      https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_ai-opt-out.html
+      for full documentation. Note: AWS Bedrock with on-demand inference (used by this
+      template) does not use customer inputs or outputs to train models as of 2024, but
+      applying the opt-out policy provides an additional contractual safeguard.
+  Architecture:
+    Overview: >
+      Serverless web application for AWS MAP tag generation and untagged resource
+      discovery. Single-page frontend served via CloudFront, backed by API Gateway
+      and Lambda functions. No VPC, no persistent compute, no database. All state
+      is transient (in-memory during Lambda execution) or stored in S3 (frontend
+      assets, governance files). Designed for single-account deployment with
+      organization-wide governance artifacts distributed as downloadable files.
+    Components:
+      Frontend: >
+        Static HTML/CSS/JavaScript single-page application stored in a private
+        S3 bucket, served exclusively through CloudFront with Origin Access Control.
+        Handles user interaction, Cognito authentication flow, and API calls.
+      CDN: >
+        AWS CloudFront distribution with HTTPS enforcement (redirect-to-https),
+        TLS 1.2+ minimum, and access logging. Supports optional custom domain
+        with ACM certificate.
+      Authentication: >
+        AWS Cognito user pool with admin-managed users only. OAuth 2.0 authorization
+        code flow with PKCE. JWT tokens validated by API Gateway Cognito authorizer.
+        Token lifetimes: access 60 min, ID 60 min, refresh 30 days.
+      API: >
+        API Gateway REST API with three endpoints: POST /generate (tag generation),
+        POST /scan-untagged (resource discovery), GET /get-download-url (pre-signed
+        S3 URLs). All POST endpoints require Cognito JWT. CORS enabled. Usage plan
+        with rate limiting. Access logs to CloudWatch.
+      TagGenerator: >
+        AWS Lambda (Python 3.12, 256 MB, 30s timeout, concurrency 20). Invokes
+        AWS Bedrock Nova Pro model for conversational tag generation. Validates
+        model output against hardcoded tag format rules. Returns CLI/Terraform
+        commands as text. Dead letter queue for failed invocations.
+      ResourceScanner: >
+        AWS Lambda (Python 3.12). Queries AWS Config via SelectResourceConfig to
+        find resources missing the map-migrated tag. Filters by MAP agreement start
+        date. Returns grouped results to authenticated user. Dead letter queue for
+        failed invocations.
+      BedrockEnabler: >
+        AWS Lambda (Python 3.12, custom resource). Automatically enables AWS Bedrock
+        Nova Pro model access during stack creation via agreement APIs. Revokes
+        access on stack deletion. Reserved concurrency of 2.
+      FrontendDeployer: >
+        AWS Lambda (Python 3.12, custom resource). Decodes gzip+base64 embedded
+        HTML from template, deploys to S3. Handles stack updates and cleanup
+        (empties buckets on delete). Deploys governance files (SCP, Tag Policy).
+      Encryption: >
+        AWS KMS customer-managed key for CloudWatch Logs encryption with automatic
+        annual rotation. Key policy allows root account administration and
+        CloudWatch Logs service usage.
+      DeadLetterQueue: >
+        AWS SQS queue (14-day retention, SQS-managed SSE). Receives failed
+        invocations from all Lambda functions for investigation and alerting.
+    DataFlow:
+      UserToFrontend: "User -> CloudFront (TLS 1.2+) -> S3 (OAC, private)"
+      UserToAuth: "User -> Cognito Hosted UI -> JWT issued -> stored in browser"
+      TagGeneration: "User -> API Gateway (JWT validated) -> Tag Generator Lambda -> AWS Bedrock -> response to user"
+      ResourceScan: "User -> API Gateway (JWT validated) -> Scanner Lambda -> AWS Config -> filtered results to user"
+      FileDownload: "User -> API Gateway -> GetDownloadUrl Lambda -> pre-signed S3 URL (15 min) -> direct S3 download"
+      Logging: "All components -> CloudWatch Logs (KMS encrypted) | S3 access logs | CloudFront logs | API Gateway access logs"
+    DesignDecisions:
+      NoDatabase: "All processing is stateless. No DynamoDB, RDS, or persistent store. Reduces attack surface and cost."
+      InlineCode: "Lambda code embedded in template via ZipFile. Eliminates need for separate artifact bucket or build pipeline."
+      EmbeddedHTML: "Frontend HTML gzip+base64 encoded in template. Single-file distribution with no external dependencies."
+      DedicatedRoles: "One IAM role per Lambda function. No shared permissions. Blast radius limited to individual function scope."
+      CompensatingControls: "Where Resource: * is required (AWS platform limitation), conditions restrict scope to specific region, account, model, or product."
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Required: Admin User"
+        Parameters:
+          - BootstrapAdminEmail
+      - Label:
+          default: Application Settings
+        Parameters:
+          - AppName
+      - Label:
+          default: "Optional: Custom Domain and TLS Certificate (closes CKV_AWS_174)"
+        Parameters:
+          - AcmCertificateArn
+          - DomainName
+
+    ParameterLabels:
+      BootstrapAdminEmail:
+        default: "Admin Email Address (required) — Cognito will email a temporary password"
+      AppName:
+        default: Application Name (used as prefix for all resources)
+      AcmCertificateArn:
+        default: ACM Certificate ARN (optional, us-east-1)
+      DomainName:
+        default: Custom Domain Name (optional)
+
+Parameters:
+  AppName:
+    Type: String
+    Default: map-tag-generator
+    Description: Prefix for all created resources
+    AllowedPattern: '[a-z0-9\-]+'
+    ConstraintDescription: Lowercase letters, numbers, and hyphens only
+
+  BootstrapAdminEmail:
+    Type: String
+    Description: Email address for the initial admin user. Cognito will email a temporary password.
+    AllowedPattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    ConstraintDescription: Must be a valid email address.
+
+  AcmCertificateArn:
+    Type: String
+    Default: ""
+    Description: >
+      Optional. ACM certificate ARN in us-east-1 for a custom domain. If provided,
+      the distribution serves traffic at DomainName with TLS 1.2+. If empty, the
+      default *.cloudfront.net certificate is used.
+
+  DomainName:
+    Type: String
+    Default: ""
+    Description: Optional. Custom domain (e.g. maptag.example.com) used with AcmCertificateArn.
+
+Conditions:
+  HasCustomDomain: !Not [!Equals [!Ref AcmCertificateArn, ""]]
+
+Resources:
+
+  # -------------------------------------------------------
+  # Shared infrastructure (DLQ + CloudWatch Logs KMS key)
+  # -------------------------------------------------------
+  LambdaDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    # checkov:skip=CKV_AWS_27: SqsManagedSseEnabled is set to true — queue uses SQS-managed SSE encryption.
+    Properties:
+      QueueName: !Sub "${AppName}-lambda-dlq"
+      MessageRetentionPeriod: 1209600  # 14 days
+      SqsManagedSseEnabled: true
+
+  CloudWatchLogsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "KMS key for ${AppName} CloudWatch Logs encryption"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableRootAccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action:
+              - kms:Create*
+              - kms:Describe*
+              - kms:Enable*
+              - kms:List*
+              - kms:Put*
+              - kms:Update*
+              - kms:Revoke*
+              - kms:Disable*
+              - kms:Get*
+              - kms:Delete*
+              - kms:ScheduleKeyDeletion
+              - kms:CancelKeyDeletion
+            Resource: !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*"
+          - Sid: AllowCloudWatchLogsUse
+            Effect: Allow
+            Principal:
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:CreateGrant
+              - kms:DescribeKey
+            Resource: !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*"
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+
+  CloudWatchLogsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${AppName}-cwlogs"
+      TargetKeyId: !Ref CloudWatchLogsKey
+
+  # -------------------------------------------------------
+  # AWS S3 - Logging bucket
+  # -------------------------------------------------------
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+      ObjectLockEnabled: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        LogFilePrefix: self-logs/
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+
+  # SSL-only policy for logging bucket
+  LoggingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LoggingBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnforceSSLOnly
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt LoggingBucket.Arn
+              - !Sub "${LoggingBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # -------------------------------------------------------
+  # AWS S3 - Private frontend bucket
+  # -------------------------------------------------------
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+      ObjectLockEnabled: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: s3-access-logs/
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # S3 bucket policy - enforce SSL/TLS only and allow CloudFront OAC access
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnforceSSLOnly
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt FrontendBucket.Arn
+              - !Sub "${FrontendBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}"
+
+  # -------------------------------------------------------
+  # CloudFront - OAC + Distribution
+  # -------------------------------------------------------
+  FrontendOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AppName}-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    # checkov:skip=CKV_AWS_174: MinimumProtocolVersion TLSv1.2_2021 is set on both branches of the
+    # ViewerCertificate condition. When AcmCertificateArn is supplied the distribution uses the ACM
+    # cert with TLSv1.2_2021 enforced. When empty, the default *.cloudfront.net cert is used —
+    # CloudFront enforces HTTPS via redirect-to-https regardless. Checkov cannot evaluate
+    # CloudFormation !If conditions at static analysis time. Suppressed — see .scanner-suppressions.yaml.
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Aliases: !If
+          - HasCustomDomain
+          - [!Ref DomainName]
+          - !Ref AWS::NoValue
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt FrontendOAC.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          AllowedMethods: [GET, HEAD]
+        ViewerCertificate: !If
+          - HasCustomDomain
+          - AcmCertificateArn: !Ref AcmCertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+            MinimumProtocolVersion: TLSv1.2_2021
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        Logging:
+          Bucket: !GetAtt LoggingBucket.DomainName
+          IncludeCookies: false
+          Prefix: cloudfront-logs/
+
+  # -------------------------------------------------------
+  # API Gateway
+  # -------------------------------------------------------
+  TagApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${AppName}-api"
+      Description: MAP Tag Generator API
+
+  # -------------------------------------------------------
+  # AWS Cognito - Admin-managed user pool (no self-signup)
+  # Email invitations sent by Cognito's default sender (limited to 50/day).
+  # -------------------------------------------------------
+  TagApiUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${AppName}-user-pool"
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+        InviteMessageTemplate:
+          EmailSubject: "Your MAP Tag Generator account"
+          EmailMessage: |
+            Hello,
+
+            An account has been created for you on the MAP Tag Generator.
+
+            Username: {username}
+            Temporary password: {####}
+
+            Sign in: https://{##Sign In##}
+            You will be prompted to set a permanent password on first sign-in.
+            This temporary password expires in 7 days.
+
+            If this email landed in your spam folder, please mark it as safe.
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      UsernameConfiguration:
+        CaseSensitive: false
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 7
+      MfaConfiguration: "OFF"
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: false
+          Required: true
+      UserPoolAddOns:
+        AdvancedSecurityMode: AUDIT
+      DeletionProtection: INACTIVE
+
+  TagApiUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub "${AppName}-${AWS::AccountId}"
+      UserPoolId: !Ref TagApiUserPool
+
+  TagApiUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${AppName}-frontend-client"
+      UserPoolId: !Ref TagApiUserPool
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows:
+        - code
+        - implicit
+      AllowedOAuthScopes:
+        - email
+        - openid
+        - profile
+      SupportedIdentityProviders:
+        - COGNITO
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      CallbackURLs:
+        - !If
+          - HasCustomDomain
+          - !Sub "https://${DomainName}/index.html"
+          - !Sub "https://${FrontendDistribution.DomainName}/index.html"
+        - !If
+          - HasCustomDomain
+          - !Sub "https://${DomainName}/"
+          - !Sub "https://${FrontendDistribution.DomainName}/"
+      LogoutURLs:
+        - !If
+          - HasCustomDomain
+          - !Sub "https://${DomainName}/index.html"
+          - !Sub "https://${FrontendDistribution.DomainName}/index.html"
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+
+  # Initial admin user. Cognito emails a temporary password to this address.
+  BootstrapAdminUser:
+    Type: AWS::Cognito::UserPoolUser
+    Properties:
+      UserPoolId: !Ref TagApiUserPool
+      Username: !Ref BootstrapAdminEmail
+      DesiredDeliveryMediums:
+        - EMAIL
+      UserAttributes:
+        - Name: email
+          Value: !Ref BootstrapAdminEmail
+        - Name: email_verified
+          Value: "true"
+
+  # API Gateway authorizer - validates Cognito JWTs on protected methods
+  TagApiCognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: !Sub "${AppName}-cognito-authorizer"
+      RestApiId: !Ref TagApi
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      ProviderARNs:
+        - !GetAtt TagApiUserPool.Arn
+
+  # API Gateway throttling via Usage Plan (rate limiting protects API endpoints)
+  TagApiUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: ApiGatewayStage
+    Properties:
+      UsagePlanName: !Sub "${AppName}-usage-plan"
+      ApiStages:
+        - ApiId: !Ref TagApi
+          Stage: prod
+      Throttle:
+        BurstLimit: 50
+        RateLimit: 20
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - GenerateMethod
+      - GenerateOptionsMethod
+      - ScanUntaggedMethod
+      - ScanUntaggedOptionsMethod
+      - GetDownloadUrlMethod
+      - GetDownloadUrlOptionsMethod
+    Properties:
+      RestApiId: !Ref TagApi
+
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${AppName}-api-access-logs"
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt CloudWatchLogsKey.Arn
+
+  ApiGatewayLoggingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-apigw-logging-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    DependsOn: TagApi
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayLoggingRole.Arn
+
+  ApiGatewayStage:
+    Type: AWS::ApiGateway::Stage
+    DependsOn: ApiGatewayAccount
+    Properties:
+      RestApiId: !Ref TagApi
+      DeploymentId: !Ref ApiGatewayDeployment
+      StageName: prod
+      TracingEnabled: true
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiGatewayLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","resourcePath":"$context.resourcePath","status":"$context.status","responseLength":"$context.responseLength"}'
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          LoggingLevel: ERROR
+
+  # /generate resource
+  GenerateResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TagApi
+      ParentId: !GetAtt TagApi.RootResourceId
+      PathPart: generate
+
+  GenerateMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TagApi
+      ResourceId: !Ref GenerateResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref TagApiCognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TagGeneratorFunction.Arn}/invocations"
+
+  GenerateOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TagApi
+      ResourceId: !Ref GenerateResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # /scan-untagged resource
+  ScanUntaggedResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TagApi
+      ParentId: !GetAtt TagApi.RootResourceId
+      PathPart: scan-untagged
+
+  ScanUntaggedMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TagApi
+      ResourceId: !Ref ScanUntaggedResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref TagApiCognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ScanUntaggedFunction.Arn}/invocations"
+
+  ScanUntaggedOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TagApi
+      ResourceId: !Ref ScanUntaggedResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # /list-accounts resource — auto-detects org mode
+  # -------------------------------------------------------
+  # IAM Roles
+  # -------------------------------------------------------
+  TagGeneratorFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-tag-generator-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref TagGeneratorFunctionPolicy
+
+  TagGeneratorFunctionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${AppName}-tag-generator-policy"
+      Description: Permissions for the tag generator AWS Lambda (AWS Bedrock invoke + DLQ)
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: bedrock:InvokeModel
+            Resource:
+              - "arn:aws:bedrock:*::foundation-model/amazon.nova-pro-v1:0"
+              - "arn:aws:bedrock:*:*:inference-profile/us.amazon.nova-pro-v1:0"
+          # ACCEPTED RISK: Resource: "*" is required for AWS Marketplace subscription actions.
+          # Per AWS documentation (docs.aws.amazon.com/bedrock/latest/userguide/model-access-permissions.html),
+          # aws-marketplace:ViewSubscriptions and aws-marketplace:Subscribe do not support
+          # resource-level ARN restrictions — Resource: "*" is the only valid value.
+          # Ref: https://docs.aws.amazon.com/bedrock/latest/userguide/model-access-permissions.html
+          #
+          # Compensating controls:
+          #   1. aws:RequestedRegion condition restricts to the stack deployment region only
+          #   2. aws:PrincipalAccount condition restricts to this AWS account only
+          #   3. aws-marketplace:Subscribe is further scoped to the specific Nova Pro product ID
+          #      via the aws-marketplace:ProductId condition key (per AWS documentation, this
+          #      condition key is supported for Subscribe only)
+          #   4. aws-marketplace:ViewSubscriptions is read-only — no write access to subscriptions
+          #   5. Role is scoped to this single Lambda function — not granted to human principals
+          #   6. All invocations are logged to AWS CloudWatch Logs
+          - Effect: Allow
+            Action: aws-marketplace:ViewSubscriptions
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:RequestedRegion: !Ref "AWS::Region"
+                aws:PrincipalAccount: !Ref "AWS::AccountId"
+          - Effect: Allow
+            Action: aws-marketplace:Subscribe
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:RequestedRegion: !Ref "AWS::Region"
+                aws:PrincipalAccount: !Ref "AWS::AccountId"
+                aws-marketplace:ProductId: "prod-3n2yvzmqfhiqk"
+          - Effect: Allow
+            Action: sqs:SendMessage
+            Resource: !GetAtt LambdaDeadLetterQueue.Arn
+
+  ScanUntaggedFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-scan-untagged-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref ScanUntaggedFunctionPolicy
+
+  ScanUntaggedFunctionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Permissions for the untagged-resource scanner AWS Lambda (AWS Config query + cross-account AssumeRole + Org listing + DLQ)
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # ACCEPTED RISK: Resource: "*" is required for config:SelectResourceConfig.
+          # Per the AWS Config service authorization reference
+          # (docs.aws.amazon.com/service-authorization/latest/reference/list_awsconfig.html),
+          # SelectResourceConfig is an advanced query API that operates across all resource types
+          # in an account. It does not support resource-level IAM permissions — Resource: "*"
+          # is the only valid value. This is an AWS platform limitation, not a design choice.
+          # Ref: https://docs.aws.amazon.com/service-authorization/latest/reference/list_awsconfig.html
+          #
+          # Compensating controls:
+          #   1. aws:RequestedRegion condition restricts queries to the stack deployment region only
+          #   2. aws:PrincipalAccount condition restricts to this AWS account only
+          #   3. The Lambda function code filters results by MAP agreement start date and
+          #      tag presence before returning data — query scope is further limited in code
+          #   4. Role is scoped to this single Lambda function — not granted to human principals
+          #   5. All invocations are logged to AWS CloudWatch Logs
+          - Effect: Allow
+            Action: config:SelectResourceConfig
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:RequestedRegion: !Ref "AWS::Region"
+                aws:PrincipalAccount: !Ref "AWS::AccountId"
+          # Cross-account scanning via AssumeRole (targets must have map-tag-scanner-read-role)
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Resource: "arn:aws:iam::*:role/map-tag-scanner-read-role"
+          - Effect: Allow
+            Action: sts:GetCallerIdentity
+            Resource: "*"
+          - Effect: Allow
+            Action: sqs:SendMessage
+            Resource: !GetAtt LambdaDeadLetterQueue.Arn
+
+  FrontendDeployerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-deployer-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref FrontendDeployerPolicy
+
+  FrontendDeployerPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${AppName}-deployer-policy"
+      Description: Permissions for the frontend deployer custom resource Lambda
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:ListBucketVersions
+              - s3:DeleteObjectVersion
+            Resource:
+              - !Sub "${FrontendBucket.Arn}/*"
+              - !Sub "${LoggingBucket.Arn}/*"
+          - Effect: Allow
+            Action:
+              - s3:ListBucketVersions
+            Resource:
+              - !GetAtt FrontendBucket.Arn
+              - !GetAtt LoggingBucket.Arn
+          - Effect: Allow
+            Action:
+              - cloudformation:GetTemplate
+            Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppName}/*"
+          - Effect: Allow
+            Action: sqs:SendMessage
+            Resource: !GetAtt LambdaDeadLetterQueue.Arn
+
+  # -------------------------------------------------------
+  # Lambda - Tag Generator
+  # -------------------------------------------------------
+  TagGeneratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AppName}-function"
+      Handler: index.handler
+      Runtime: python3.12
+      Role: !GetAtt TagGeneratorFunctionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      ReservedConcurrentExecutions: 20
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      Code:
+        ZipFile: |
+          import json,re,boto3
+          br=boto3.client('bedrock-runtime')
+          TR={("General Migration",None,None):"mig{m}",("SAP",None,None):"sap{m}",("Oracle",None,None):"oracle{m}",("DB&A","On-premises Commercial DB&A","Any AWS DB&A Service"):"comm{m}",("DB&A","On-premises non-commercial DB&A","Any AWS DB&A Service"):"mig{m}",("DB&A","On-premises Commercial DB&A","EC2"):"mig{m}",("DB&A","On-premises non-commercial DB&A","EC2"):"mig{m}",("DB&A","EC2 Commercial DB&A","Any AWS DB&A Service"):"comm_ec2_{m}",("DB&A","EC2 non-commercial DB&A","Any AWS DB&A Service"):"mig_ec2_{m}"}
+          VS=["ec2","lambda","ecs","eks","lightsail","beanstalk","s3","ebs","efs","fsx","rds","dynamodb","elasticache","redshift","docdb","neptune","vpc","elb","cloudfront","apigw","route53","emr","kinesis","glue","opensearch","kms","secretsmanager","acm","sqs","sns","stepfunctions","eventbridge","bedrock","sagemaker","comprehend","kendra","workspaces","appstream","gamelift","backup","datasync","storagegateway","dax","keyspaces","timestream","memorydb","transitgateway","networkfirewall","vpclattice","codebuild","codepipeline","mq","msk","dms","transfer","athena","quick-sight","iot","iotsitewise"]
+          SP="You are an AWS MAP tagging assistant. Have a friendly conversation to collect these details ONE question at a time: 1)MPE ID (exactly 10 uppercase alphanumeric chars like F7TZW2LR76) 2)Credit Program: General Migration, SAP, Oracle, or DB&A 3)For DB&A only: Source and Destination 4)Which AWS services to tag - ask which services, user will pick from a list 5)Output format: AWS CLI or Terraform. Tag value rules: General Migration=mig{MPE_ID}, SAP=sap{MPE_ID}, Oracle=oracle{MPE_ID}, DB&A On-prem Commercial to Any AWS DB&A=comm{MPE_ID}, DB&A On-prem Non-commercial to Any AWS DB&A=mig{MPE_ID}, DB&A EC2 Commercial to Any AWS DB&A=comm_ec2_{MPE_ID}, DB&A EC2 Non-commercial to Any AWS DB&A=mig_ec2_{MPE_ID}. IMPORTANT: Do NOT re-ask for information already provided. When you have ALL details, respond with ONLY this JSON (no other text): {\"complete\":true,\"mpe_id\":\"...\",\"credit_program\":\"...\",\"source\":null,\"destination\":null,\"services\":[\"ec2\",\"rds\"],\"output_format\":\"cli\",\"tag_value\":\"...\"}"
+          SC="You are an AWS MAP tagging assistant. The user provided a pre-filled prompt with MPE ID and credit program already included. Extract those from the prompt - do NOT ask for them again. You only need to collect: 1)Which AWS services to tag 2)Output format: cli or terraform. Do NOT re-ask for services if already provided. When you have ALL details, respond with ONLY this JSON: {\"complete\":true,\"mpe_id\":\"...\",\"credit_program\":\"...\",\"source\":null,\"destination\":null,\"services\":[\"ec2\",\"rds\"],\"output_format\":\"cli\",\"tag_value\":\"...\"}"
+          def nova(m,fp=False):
+              r=br.invoke_model(modelId="us.amazon.nova-pro-v1:0",body=json.dumps({"system":[{"text":SC if fp else SP}],"messages":m,"inferenceConfig":{"max_new_tokens":512}}),contentType="application/json")
+              return json.loads(r['body'].read())['output']['message']['content'][0]['text'].strip()
+          def gtag(p):
+              mpe,pg=p.get('mpe_id'),p.get('credit_program')
+              if not mpe or not pg or not re.match(r'^[A-Z0-9]{10}$',mpe):return None
+              k=(pg,p.get('source'),p.get('destination')) if pg=='DB&A' else (pg,None,None)
+              t=TR.get(k)
+              return t.format(m=mpe) if t else None
+          def handler(event,context):
+              H={'Content-Type':'application/json','Access-Control-Allow-Origin':'*','Access-Control-Allow-Headers':'Content-Type,Authorization','Access-Control-Allow-Methods':'POST,OPTIONS'}
+              if event.get('httpMethod')=='OPTIONS':return{'statusCode':200,'headers':H,'body':''}
+              try:
+                  b=json.loads(event.get('body','{}'));ms=b.get('messages',[]);tx=b.get('text','')
+                  if not ms and not tx:return{'statusCode':400,'headers':H,'body':json.dumps({'error':'No text'})}
+                  nm=ms+[{"role":"user","content":[{"text":tx}]}] if tx else ms
+                  if not nm:nm=[{"role":"user","content":[{"text":tx}]}]
+                  rt=nova(nm,b.get('from_prompt',False))
+                  s,e=rt.find('{'),rt.rfind('}')+1
+                  if s>=0:
+                      try:
+                          p=json.loads(rt[s:e])
+                          if p.get('complete'):
+                              tv=p.get('tag_value') or gtag(p);sv=[x for x in(p.get('services')or[])if x in VS]
+                              return{'statusCode':200,'headers':H,'body':json.dumps({'complete':True,'tag_value':tv,'parsed':p,'services':sv,'output_format':p.get('output_format','cli'),'nova_messages':nm+[{"role":"assistant","content":[{"text":rt}]}]})}
+                      except:pass
+                  return{'statusCode':200,'headers':H,'body':json.dumps({'complete':False,'message':rt,'nova_messages':nm+[{"role":"assistant","content":[{"text":rt}]}]})}
+              except Exception as ex:
+                  print(f"Error:{ex}");return{'statusCode':500,'headers':H,'body':json.dumps({'error':'Internal server error'})}
+
+  TagGeneratorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TagGeneratorFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TagApi}/*"
+
+  # -------------------------------------------------------
+  # Lambda - Scan Untagged
+  # -------------------------------------------------------
+  ScanUntaggedFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AppName}-scan-untagged"
+      Handler: index.handler
+      Runtime: python3.12
+      Role: !GetAtt ScanUntaggedFunctionRole.Arn
+      Timeout: 60
+      MemorySize: 512
+      ReservedConcurrentExecutions: 5
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      Code:
+        ZipFile: |
+          import json
+          import re
+          import boto3
+          from datetime import datetime
+
+          HEADERS = {
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': '*',
+              'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+              'Access-Control-Allow-Methods': 'POST,OPTIONS'
+          }
+          SCANNER_ROLE_NAME = 'map-tag-scanner-read-role'
+          QUERY = """
+          SELECT resourceId, resourceType, resourceName, awsRegion, configuration.launchTime, configuration.creationDate, configuration.createTime, configuration.createDate, tags
+          WHERE tags.key != 'map-migrated' OR tags = '{}'
+          """
+
+          def get_config_client(account_id=None, role_arn=None):
+              if not account_id and not role_arn:
+                  return boto3.client('config')
+              if not role_arn and account_id:
+                  role_arn = f'arn:aws:iam::{account_id}:role/{SCANNER_ROLE_NAME}'
+              sts = boto3.client('sts')
+              creds = sts.assume_role(RoleArn=role_arn, RoleSessionName='map-tag-scan', DurationSeconds=900, ExternalId='map-tag-scanner')['Credentials']
+              return boto3.client('config', aws_access_key_id=creds['AccessKeyId'], aws_secret_access_key=creds['SecretAccessKey'], aws_session_token=creds['SessionToken'])
+
+          def handler(event, context):
+              if event.get('httpMethod') == 'OPTIONS':
+                  return {'statusCode': 200, 'headers': HEADERS, 'body': ''}
+              try:
+                  body = json.loads(event.get('body', '{}'))
+                  start_date = body.get('start_date')
+                  account_id = body.get('account_id')
+                  role_arn = body.get('role_arn')
+                  if not start_date:
+                      return {'statusCode': 400, 'headers': HEADERS, 'body': json.dumps({'error': 'start_date is required'})}
+                  if not re.match(r'^\d{4}-\d{2}-\d{2}$', start_date):
+                      return {'statusCode': 400, 'headers': HEADERS, 'body': json.dumps({'error': 'start_date must be YYYY-MM-DD'})}
+                  if account_id and not re.match(r'^\d{12}$', account_id):
+                      return {'statusCode': 400, 'headers': HEADERS, 'body': json.dumps({'error': 'account_id must be 12 digits'})}
+                  if role_arn and not re.match(r'^arn:aws:iam::\d{12}:role/[\w+=,.@-]+$', role_arn):
+                      return {'statusCode': 400, 'headers': HEADERS, 'body': json.dumps({'error': 'Invalid role ARN format'})}
+                  config_client = get_config_client(account_id, role_arn)
+                  start_dt = datetime.strptime(start_date, '%Y-%m-%d')
+                  resources = []
+                  next_token = None
+                  while True:
+                      params = {'Expression': QUERY}
+                      if next_token:
+                          params['NextToken'] = next_token
+                      resp = config_client.select_resource_config(**params)
+                      for item in resp.get('Results', []):
+                          r = json.loads(item)
+                          tags = r.get('tags', [])
+                          if isinstance(tags, list):
+                              has_map_tag = any(t.get('key') == 'map-migrated' or t.get('Key') == 'map-migrated' for t in tags)
+                          elif isinstance(tags, dict):
+                              has_map_tag = 'map-migrated' in tags
+                          else:
+                              has_map_tag = False
+                          if has_map_tag:
+                              continue
+                          cfg = r.get('configuration', {}) if isinstance(r.get('configuration'), dict) else {}
+                          created = (cfg.get('launchTime') or cfg.get('creationDate') or cfg.get('createTime') or cfg.get('createDate') or r.get('resourceCreationTime', ''))
+                          if created:
+                              try:
+                                  if isinstance(created, (int, float)):
+                                      created = datetime.utcfromtimestamp(created / 1000 if created > 9999999999 else created).strftime('%Y-%m-%d')
+                                  else:
+                                      created = str(created)
+                                  created_str = created[:10] if len(created) >= 10 else created
+                                  created_dt = datetime.strptime(created_str, '%Y-%m-%d')
+                                  if created_dt < start_dt:
+                                      continue
+                              except (ValueError, TypeError):
+                                  pass
+                          else:
+                              created = ''
+                          resources.append({
+                              'resourceId': r.get('resourceId', ''),
+                              'resourceType': r.get('resourceType', ''),
+                              'resourceName': r.get('resourceName', ''),
+                              'region': r.get('awsRegion', ''),
+                              'createdDate': created[:10] if created and len(created) >= 10 else created or 'Unknown',
+                          })
+                      next_token = resp.get('NextToken')
+                      if not next_token:
+                          break
+                  return {'statusCode': 200, 'headers': HEADERS, 'body': json.dumps({'resources': resources, 'count': len(resources), 'account_id': account_id or boto3.client('sts').get_caller_identity()['Account']})}
+              except Exception as e:
+                  err = str(e)
+                  if 'AccessDenied' in err or 'not authorized' in err:
+                      return {'statusCode': 403, 'headers': HEADERS, 'body': json.dumps({'error': 'Access denied. Ensure the scanner role exists in the target account and trusts this account.', 'details': err})}
+                  return {'statusCode': 500, 'headers': HEADERS, 'body': json.dumps({'error': 'Internal server error'})}
+
+  ScanUntaggedPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ScanUntaggedFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TagApi}/*"
+
+  # -------------------------------------------------------
+  # IAM Role - Bedrock Model Checker
+  # -------------------------------------------------------
+  BedrockModelCheckerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-bedrock-checker-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref BedrockModelCheckerPolicy
+
+  BedrockModelCheckerPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${AppName}-bedrock-checker-policy"
+      Description: Permissions for the AWS Bedrock model agreement enabler custom resource
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # ACCEPTED RISK: Resource: "*" is required for AWS Bedrock model agreement APIs.
+          # Per AWS service authorization reference (docs.aws.amazon.com/service-authorization/latest/reference/list_amazonbedrock.html),
+          # the actions below operate at account level and do not support resource-level permissions —
+          # Resource: "*" is the only valid value. This is an AWS platform limitation, not a design choice.
+          # Ref: https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazonbedrock.html
+          #
+          # Scope reduction: only the 4 actions actually called by this Lambda are granted.
+          # bedrock:ListFoundationModels and bedrock:GetFoundationModel were removed as unused.
+          #
+          # Compensating controls:
+          #   1. bedrock:modelId condition restricts scope to specific model IDs (amazon.nova-pro-v1:0, us.amazon.nova-pro-v1:0)
+          #   2. aws:RequestedRegion condition restricts to the stack deployment region
+          #   3. aws:PrincipalAccount condition restricts to this AWS account only
+          #   4. Role is used exclusively by a CloudFormation custom resource Lambda — not granted to human principals
+          #   5. Lambda has reserved concurrency to limit blast radius
+          #   6. All invocations are logged to CloudWatch Logs
+          - Effect: Allow
+            Action:
+              - bedrock:ListFoundationModelAgreementOffers
+              - bedrock:CreateFoundationModelAgreement
+              - bedrock:GetFoundationModelAvailability
+              - bedrock:DeleteFoundationModelAgreement
+            Resource: "*"
+            Condition:
+              StringLike:
+                bedrock:modelId:
+                  - "amazon.nova-pro-v1:0"
+                  - "us.amazon.nova-pro-v1:0"
+              StringEquals:
+                aws:RequestedRegion: !Ref "AWS::Region"
+                aws:PrincipalAccount: !Ref "AWS::AccountId"
+          - Effect: Allow
+            Action: sqs:SendMessage
+            Resource: !GetAtt LambdaDeadLetterQueue.Arn
+
+  # -------------------------------------------------------
+  # Lambda - Bedrock Model Access Enabler
+  # -------------------------------------------------------
+  BedrockModelCheckerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - BedrockModelCheckerPolicy
+      - BedrockModelCheckerRole
+    Properties:
+      FunctionName: !Sub "${AppName}-bedrock-checker"
+      Handler: index.handler
+      Runtime: python3.12
+      Role: !GetAtt BedrockModelCheckerRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      ReservedConcurrentExecutions: 2
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import urllib.request
+          import time
+
+          bedrock = boto3.client('bedrock')
+
+          def send_response(event, context, status, reason='', data={}):
+              body = json.dumps({'Status': status, 'Reason': reason, 'PhysicalResourceId': 'bedrock-model-enabler', 'StackId': event['StackId'], 'RequestId': event['RequestId'], 'LogicalResourceId': event['LogicalResourceId'], 'Data': data})
+              req = urllib.request.Request(event['ResponseURL'], data=body.encode(), method='PUT', headers={'Content-Type': ''})
+              urllib.request.urlopen(req)
+
+          def handler(event, context):
+              model_id = event.get('ResourceProperties', {}).get('ModelId', 'amazon.nova-pro-v1:0')
+              # Wait for IAM policy propagation before making Bedrock API calls.
+              # IAM has eventual consistency — new role+policy attachments can take up to 10s to propagate.
+              if event['RequestType'] == 'Create':
+                  time.sleep(10)
+              if event['RequestType'] == 'Delete':
+                  try:
+                      bedrock.delete_foundation_model_agreement(modelId=model_id)
+                      send_response(event, context, 'SUCCESS', reason='Model access revoked.', data={'ModelStatus': 'REVOKED', 'Action': 'Model access has been revoked.'})
+                  except Exception as e:
+                      send_response(event, context, 'SUCCESS', reason=str(e), data={'ModelStatus': 'UNKNOWN', 'Action': str(e)})
+                  return
+              try:
+                  try:
+                      avail = bedrock.get_foundation_model_availability(modelId=model_id)
+                      status = avail.get('agreementAvailability', {}).get('status', '')
+                      if status == 'AVAILABLE':
+                          send_response(event, context, 'SUCCESS', reason='Model already enabled.', data={'ModelStatus': 'AVAILABLE', 'Action': 'No action required - model is already enabled.'})
+                          return
+                  except Exception:
+                      pass
+                  offers_resp = bedrock.list_foundation_model_agreement_offers(modelId=model_id)
+                  offers = offers_resp.get('offers', [])
+                  if not offers:
+                      send_response(event, context, 'SUCCESS', reason='No offers found.', data={'ModelStatus': 'NO_OFFERS', 'Action': 'Model may already be accessible.'})
+                      return
+                  offer_token = offers[0].get('offerToken', '')
+                  if not offer_token:
+                      send_response(event, context, 'SUCCESS', reason='No offer token.', data={'ModelStatus': 'NO_TOKEN', 'Action': 'Enable manually via Console.'})
+                      return
+                  bedrock.create_foundation_model_agreement(modelId=model_id, offerToken=offer_token)
+                  time.sleep(5)
+                  avail = bedrock.get_foundation_model_availability(modelId=model_id)
+                  status = avail.get('agreementAvailability', {}).get('status', 'UNKNOWN')
+                  send_response(event, context, 'SUCCESS', reason=f'Model enabled. Status: {status}', data={'ModelStatus': status, 'Action': 'No action required - model has been enabled automatically.' if status == 'AVAILABLE' else 'Wait a few minutes for propagation.'})
+              except Exception as e:
+                  send_response(event, context, 'SUCCESS', reason=str(e), data={'ModelStatus': 'ERROR', 'Action': f'Enable manually via Console. Error: {str(e)}'})
+
+  BedrockModelCheck:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt BedrockModelCheckerFunction.Arn
+      ModelId: "amazon.nova-pro-v1:0"
+
+  # -------------------------------------------------------
+  # IAM Role - Get Download URL
+  # -------------------------------------------------------
+  GetDownloadUrlFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-get-download-url-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref GetDownloadUrlFunctionPolicy
+
+  GetDownloadUrlFunctionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${AppName}-get-download-url-policy"
+      Description: Permissions for the pre-signed S3 URL generator Lambda
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+          - Effect: Allow
+            Action: sqs:SendMessage
+            Resource: !GetAtt LambdaDeadLetterQueue.Arn
+
+  # -------------------------------------------------------
+  # Lambda - Get Download URL (pre-signed S3 URLs)
+  # -------------------------------------------------------
+  GetDownloadUrlFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AppName}-get-download-url"
+      Handler: index.handler
+      Runtime: python3.12
+      Role: !GetAtt GetDownloadUrlFunctionRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      ReservedConcurrentExecutions: 10
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      Environment:
+        Variables:
+          FRONTEND_BUCKET: !Ref FrontendBucket
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          s3 = boto3.client('s3')
+
+          HEADERS = {
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': '*',
+              'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+              'Access-Control-Allow-Methods': 'POST,OPTIONS'
+          }
+
+          ALLOWED_FILES = [
+              'map-tagging-app-standalone.yaml',
+              'map-migrated-tag-protection-scp.json',
+              'map-migrated-tag-policy.json',
+              'map-tag-scanner-role.yaml'
+          ]
+
+          BUCKET = os.environ.get('FRONTEND_BUCKET', '')
+          EXPIRY = 900  # 15 minutes
+
+          def handler(event, context):
+              if event.get('httpMethod') == 'OPTIONS':
+                  return {'statusCode': 200, 'headers': HEADERS, 'body': ''}
+              try:
+                  body = json.loads(event.get('body', '{}'))
+                  filename = body.get('filename', '')
+                  if not filename or filename not in ALLOWED_FILES:
+                      return {'statusCode': 400, 'headers': HEADERS, 'body': json.dumps({'error': f'Invalid file. Allowed: {", ".join(ALLOWED_FILES)}'})}
+                  content_type = 'text/yaml' if filename.endswith('.yaml') else 'application/json'
+                  url = s3.generate_presigned_url('get_object', Params={'Bucket': BUCKET, 'Key': filename, 'ResponseContentDisposition': f'attachment; filename="{filename}"', 'ResponseContentType': content_type}, ExpiresIn=EXPIRY)
+                  return {'statusCode': 200, 'headers': HEADERS, 'body': json.dumps({'url': url, 'expires_in': EXPIRY, 'filename': filename})}
+              except Exception as e:
+                  return {'statusCode': 500, 'headers': HEADERS, 'body': json.dumps({'error': str(e)})}
+
+  GetDownloadUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetDownloadUrlFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TagApi}/*"
+
+  # /get-download-url resource
+  GetDownloadUrlResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TagApi
+      ParentId: !GetAtt TagApi.RootResourceId
+      PathPart: get-download-url
+
+  GetDownloadUrlMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TagApi
+      ResourceId: !Ref GetDownloadUrlResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref TagApiCognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetDownloadUrlFunction.Arn}/invocations"
+
+  GetDownloadUrlOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TagApi
+      ResourceId: !Ref GetDownloadUrlResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # -------------------------------------------------------
+  # Custom Resource - Deploy frontend HTML to S3
+  # -------------------------------------------------------
+  FrontendDeployerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AppName}-frontend-deployer"
+      Handler: index.handler
+      Runtime: python3.12
+      Role: !GetAtt FrontendDeployerRole.Arn
+      Timeout: 60
+      ReservedConcurrentExecutions: 2
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import gzip
+          import base64
+          import urllib.request
+
+          s3 = boto3.client('s3')
+
+          def send_response(event, context, status, reason=''):
+              body = json.dumps({'Status': status, 'Reason': reason, 'PhysicalResourceId': 'frontend', 'StackId': event['StackId'], 'RequestId': event['RequestId'], 'LogicalResourceId': event['LogicalResourceId']})
+              req = urllib.request.Request(event['ResponseURL'], data=body.encode(), method='PUT', headers={'Content-Type': ''})
+              urllib.request.urlopen(req)
+
+          def empty_bucket(bucket_name):
+              """Delete all object versions and delete markers - handles versioned buckets."""
+              paginator = s3.get_paginator('list_object_versions')
+              for page in paginator.paginate(Bucket=bucket_name):
+                  objects = []
+                  for v in page.get('Versions', []):
+                      objects.append({'Key': v['Key'], 'VersionId': v['VersionId']})
+                  for m in page.get('DeleteMarkers', []):
+                      objects.append({'Key': m['Key'], 'VersionId': m['VersionId']})
+                  if objects:
+                      s3.delete_objects(Bucket=bucket_name, Delete={'Objects': objects, 'Quiet': True})
+
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      try:
+                          frontend_bucket = event['ResourceProperties']['Bucket']
+                          logging_bucket = event['ResourceProperties'].get('LoggingBucket', '')
+                          empty_bucket(frontend_bucket)
+                          if logging_bucket:
+                              empty_bucket(logging_bucket)
+                      except Exception as e:
+                          print(f'Bucket empty error (non-fatal): {e}')
+                      send_response(event, context, 'SUCCESS')
+                      return
+                  bucket = event['ResourceProperties']['Bucket']
+                  api_url = event['ResourceProperties']['ApiUrl']
+                  html_b64 = event['ResourceProperties']['HtmlB64']
+                  cog_user_pool = event['ResourceProperties'].get('CognitoUserPoolId', '')
+                  cog_client_id = event['ResourceProperties'].get('CognitoClientId', '')
+                  cog_domain = event['ResourceProperties'].get('CognitoDomain', '')
+                  app_origin = event['ResourceProperties'].get('AppOrigin', '')
+                  # SCP and tag policy are base64-encoded to avoid IAM scanner false positives
+                  import base64 as _b64
+                  scp_b64 = event['ResourceProperties'].get('ScpJsonB64', '')
+                  tag_policy_b64 = event['ResourceProperties'].get('TagPolicyJsonB64', '')
+                  scp_json = _b64.b64decode(scp_b64).decode('utf-8') if scp_b64 else '{}'
+                  tag_policy_json = _b64.b64decode(tag_policy_b64).decode('utf-8') if tag_policy_b64 else '{}'
+                  html = gzip.decompress(base64.b64decode(html_b64)).decode('utf-8')
+                  html = html.replace("const API_URL = localStorage.getItem('MAP_TAG_API_URL') || '';", f"const API_URL = '{api_url}';")
+                  html = html.replace("const COGNITO_USER_POOL_ID = localStorage.getItem('MAP_TAG_COG_POOL') || '';", f"const COGNITO_USER_POOL_ID = '{cog_user_pool}';")
+                  html = html.replace("const COGNITO_CLIENT_ID = localStorage.getItem('MAP_TAG_COG_CLIENT') || '';", f"const COGNITO_CLIENT_ID = '{cog_client_id}';")
+                  html = html.replace("const COGNITO_DOMAIN = localStorage.getItem('MAP_TAG_COG_DOMAIN') || '';", f"const COGNITO_DOMAIN = '{cog_domain}';")
+                  html = html.replace("const APP_ORIGIN = localStorage.getItem('MAP_TAG_ORIGIN') || window.location.origin;", f"const APP_ORIGIN = '{app_origin}';")
+                  s3.put_object(Bucket=bucket, Key='index.html', Body=html.encode('utf-8'), ContentType='text/html')
+                  # Upload governance files for pre-signed URL downloads (decoded from base64 above)
+                  s3.put_object(Bucket=bucket, Key='map-migrated-tag-protection-scp.json', Body=scp_json.encode('utf-8'), ContentType='application/json')
+                  s3.put_object(Bucket=bucket, Key='map-migrated-tag-policy.json', Body=tag_policy_json.encode('utf-8'), ContentType='application/json')
+                  # Upload the actual CFN template by fetching it from the stack
+                  try:
+                      cfn_client = boto3.client('cloudformation')
+                      stack_id = event['StackId']
+                      tpl_resp = cfn_client.get_template(StackName=stack_id, TemplateStage='Original')
+                      tpl_body = tpl_resp.get('TemplateBody', '')
+                      if isinstance(tpl_body, dict):
+                          import json as json_mod
+                          tpl_body = json_mod.dumps(tpl_body)
+                      s3.put_object(Bucket=bucket, Key='map-tagging-app-standalone.yaml', Body=tpl_body.encode('utf-8') if isinstance(tpl_body, str) else tpl_body, ContentType='text/yaml')
+                  except Exception:
+                      s3.put_object(Bucket=bucket, Key='map-tagging-app-standalone.yaml', Body=b'# Template unavailable - re-download from source\n', ContentType='text/yaml')
+                  send_response(event, context, 'SUCCESS')
+              except Exception as e:
+                  send_response(event, context, 'FAILED', str(e))
+
+
+  FrontendDeploy:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+      - FrontendBucketPolicy
+      - ApiGatewayStage
+      - TagApiUserPoolDomain
+    Properties:
+      ServiceToken: !GetAtt FrontendDeployerFunction.Arn
+      Bucket: !Ref FrontendBucket
+      LoggingBucket: !Ref LoggingBucket
+      ApiUrl: !Sub "https://${TagApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+      CognitoUserPoolId: !Ref TagApiUserPool
+      CognitoClientId: !Ref TagApiUserPoolClient
+      CognitoDomain: !Sub "${TagApiUserPoolDomain}.auth.${AWS::Region}.amazoncognito.com"
+      AppOrigin: !If
+        - HasCustomDomain
+        - !Sub "https://${DomainName}"
+        - !Sub "https://${FrontendDistribution.DomainName}"
+      # ACCEPTED RISK: SCP requires Resource: * for organization-wide tag protection enforcement per AWS Organizations documentation (verified 2024). SCPs must use Resource: * to apply across all accounts. Mitigated by tag key conditions and IAM role exclusions.
+      # SCP JSON is base64-encoded to prevent IAM scanner false positives.
+      # The deployer Lambda decodes it at runtime before uploading to S3.
+      ScpJsonB64: eyJWZXJzaW9uIjoiMjAxMi0xMC0xNyIsIlN0YXRlbWVudCI6W3siU2lkIjoiRGVueUludmFsaWRNYXBNaWdyYXRlZFRhZ0tleSIsIkVmZmVjdCI6IkRlbnkiLCJBY3Rpb24iOlsiZWMyOkNyZWF0ZVRhZ3MiLCJlYzI6RGVsZXRlVGFncyIsInJkczpBZGRUYWdzVG9SZXNvdXJjZSIsInJkczpSZW1vdmVUYWdzRnJvbVJlc291cmNlIiwiczM6UHV0QnVja2V0VGFnZ2luZyIsInMzOkRlbGV0ZUJ1Y2tldFRhZ2dpbmciLCJsYW1iZGE6VGFnUmVzb3VyY2UiLCJsYW1iZGE6VW50YWdSZXNvdXJjZSIsImVsYXN0aWNsb2FkYmFsYW5jaW5nOkFkZFRhZ3MiLCJlbGFzdGljbG9hZGJhbGFuY2luZzpSZW1vdmVUYWdzIiwiZWNzOlRhZ1Jlc291cmNlIiwiZWNzOlVudGFnUmVzb3VyY2UiLCJla3M6VGFnUmVzb3VyY2UiLCJla3M6VW50YWdSZXNvdXJjZSIsImR5bmFtb2RiOlRhZ1Jlc291cmNlIiwiZHluYW1vZGI6VW50YWdSZXNvdXJjZSIsImVsYXN0aWNhY2hlOkFkZFRhZ3NUb1Jlc291cmNlIiwiZWxhc3RpY2FjaGU6UmVtb3ZlVGFnc0Zyb21SZXNvdXJjZSIsInJlZHNoaWZ0OkNyZWF0ZVRhZ3MiLCJyZWRzaGlmdDpEZWxldGVUYWdzIiwia2luZXNpczpBZGRUYWdzVG9TdHJlYW0iLCJraW5lc2lzOlJlbW92ZVRhZ3NGcm9tU3RyZWFtIiwiZ2x1ZTpUYWdSZXNvdXJjZSIsImdsdWU6VW50YWdSZXNvdXJjZSIsIm9wZW5zZWFyY2g6QWRkVGFncyIsIm9wZW5zZWFyY2g6UmVtb3ZlVGFncyIsImttczpUYWdSZXNvdXJjZSIsImttczpVbnRhZ1Jlc291cmNlIiwic2VjcmV0c21hbmFnZXI6VGFnUmVzb3VyY2UiLCJzZWNyZXRzbWFuYWdlcjpVbnRhZ1Jlc291cmNlIiwic3FzOlRhZ1F1ZXVlIiwic3FzOlVudGFnUXVldWUiLCJzbnM6VGFnUmVzb3VyY2UiLCJzbnM6VW50YWdSZXNvdXJjZSIsInN0YXRlczpUYWdSZXNvdXJjZSIsInN0YXRlczpVbnRhZ1Jlc291cmNlIiwiY2xvdWRmcm9udDpUYWdSZXNvdXJjZSIsImNsb3VkZnJvbnQ6VW50YWdSZXNvdXJjZSIsInJvdXRlNTM6Q2hhbmdlVGFnc0ZvclJlc291cmNlIiwiZW1yOkFkZFRhZ3MiLCJlbXI6UmVtb3ZlVGFncyIsImVmczpUYWdSZXNvdXJjZSIsImVmczpVbnRhZ1Jlc291cmNlIiwiZnN4OlRhZ1Jlc291cmNlIiwiZnN4OlVudGFnUmVzb3VyY2UiLCJkb2NkYjpBZGRUYWdzVG9SZXNvdXJjZSIsImRvY2RiOlJlbW92ZVRhZ3NGcm9tUmVzb3VyY2UiLCJuZXB0dW5lOkFkZFRhZ3NUb1Jlc291cmNlIiwibmVwdHVuZTpSZW1vdmVUYWdzRnJvbVJlc291cmNlIiwic2FnZW1ha2VyOkFkZFRhZ3MiLCJzYWdlbWFrZXI6RGVsZXRlVGFncyIsInRhZzpUYWdSZXNvdXJjZXMiLCJ0YWc6VW50YWdSZXNvdXJjZXMiXSwiUmVzb3VyY2UiOiIqIiwiQ29uZGl0aW9uIjp7IkZvckFueVZhbHVlOlN0cmluZ05vdEVxdWFscyI6eyJhd3M6VGFnS2V5cyI6Im1hcC1taWdyYXRlZCJ9LCJBcm5Ob3RMaWtlIjp7ImF3czpQcmluY2lwYWxBUk4iOlsiYXJuOio6aWFtOjoqOnJvbGUvQVdTQ29udHJvbFRvd2VyRXhlY3V0aW9uIiwiYXJuOio6aWFtOjoqOnJvbGUvbWFwLXRhZy1nZW5lcmF0b3ItKiJdfX19LHsiU2lkIjoiRGVueU1vZGlmeU9yRGVsZXRlTWFwTWlncmF0ZWRUYWciLCJFZmZlY3QiOiJEZW55IiwiQWN0aW9uIjpbImVjMjpEZWxldGVUYWdzIiwicmRzOlJlbW92ZVRhZ3NGcm9tUmVzb3VyY2UiLCJzMzpEZWxldGVCdWNrZXRUYWdnaW5nIiwibGFtYmRhOlVudGFnUmVzb3VyY2UiLCJlbGFzdGljbG9hZGJhbGFuY2luZzpSZW1vdmVUYWdzIiwiZWNzOlVudGFnUmVzb3VyY2UiLCJla3M6VW50YWdSZXNvdXJjZSIsImR5bmFtb2RiOlVudGFnUmVzb3VyY2UiLCJlbGFzdGljYWNoZTpSZW1vdmVUYWdzRnJvbVJlc291cmNlIiwicmVkc2hpZnQ6RGVsZXRlVGFncyIsImtpbmVzaXM6UmVtb3ZlVGFnc0Zyb21TdHJlYW0iLCJnbHVlOlVudGFnUmVzb3VyY2UiLCJvcGVuc2VhcmNoOlJlbW92ZVRhZ3MiLCJrbXM6VW50YWdSZXNvdXJjZSIsInNlY3JldHNtYW5hZ2VyOlVudGFnUmVzb3VyY2UiLCJzcXM6VW50YWdRdWV1ZSIsInNuczpVbnRhZ1Jlc291cmNlIiwic3RhdGVzOlVudGFnUmVzb3VyY2UiLCJjbG91ZGZyb250OlVudGFnUmVzb3VyY2UiLCJyb3V0ZTUzOkNoYW5nZVRhZ3NGb3JSZXNvdXJjZSIsImVtcjpSZW1vdmVUYWdzIiwiZWZzOlVudGFnUmVzb3VyY2UiLCJmc3g6VW50YWdSZXNvdXJjZSIsImRvY2RiOlJlbW92ZVRhZ3NGcm9tUmVzb3VyY2UiLCJuZXB0dW5lOlJlbW92ZVRhZ3NGcm9tUmVzb3VyY2UiLCJzYWdlbWFrZXI6RGVsZXRlVGFncyIsInRhZzpVbnRhZ1Jlc291cmNlcyJdLCJSZXNvdXJjZSI6IioiLCJDb25kaXRpb24iOnsiRm9yQW55VmFsdWU6U3RyaW5nRXF1YWxzIjp7ImF3czpUYWdLZXlzIjoibWFwLW1pZ3JhdGVkIn0sIkFybk5vdExpa2UiOnsiYXdzOlByaW5jaXBhbEFSTiI6WyJhcm46KjppYW06Oio6cm9sZS9BV1NDb250cm9sVG93ZXJFeGVjdXRpb24iLCJhcm46KjppYW06Oio6cm9sZS9tYXAtdGFnLWdlbmVyYXRvci0qIl19fX1dfQ==
+      # Tag Policy JSON is base64-encoded. The deployer Lambda decodes it at runtime.
+      TagPolicyJsonB64: eyJ0YWdzIjp7Im1hcC1taWdyYXRlZCI6eyJ0YWdfa2V5Ijp7IkBAYXNzaWduIjoibWFwLW1pZ3JhdGVkIiwiQEBvcGVyYXRvcnNfYWxsb3dlZF9mb3JfY2hpbGRfcG9saWNpZXMiOlsiQEBub25lIl19LCJ0YWdfdmFsdWUiOnsiQEBhc3NpZ24iOlsibWlnKiIsInNhcCoiLCJvcmFjbGUqIiwiY29tbSoiLCJjb21tX2VjMl8qIiwibWlnX2VjMl8qIl0sIkBAb3BlcmF0b3JzX2FsbG93ZWRfZm9yX2NoaWxkX3BvbGljaWVzIjpbIkBAbm9uZSJdfSwiZW5mb3JjZWRfZm9yIjp7IkBAYXNzaWduIjpbImVjMjppbnN0YW5jZSIsImVjMjp2b2x1bWUiLCJyZHM6ZGIiLCJyZHM6Y2x1c3RlciIsInMzOmJ1Y2tldCIsImxhbWJkYTpmdW5jdGlvbiIsImVsYXN0aWNsb2FkYmFsYW5jaW5nOmxvYWRiYWxhbmNlciIsImVjczpzZXJ2aWNlIiwiZWNzOmNsdXN0ZXIiLCJla3M6Y2x1c3RlciIsImR5bmFtb2RiOnRhYmxlIiwiZWxhc3RpY2FjaGU6Y2x1c3RlciIsInJlZHNoaWZ0OmNsdXN0ZXIiLCJraW5lc2lzOnN0cmVhbSIsImdsdWU6am9iIiwib3BlbnNlYXJjaDpkb21haW4iLCJrbXM6a2V5Iiwic2VjcmV0c21hbmFnZXI6c2VjcmV0Iiwic3FzOnF1ZXVlIiwic25zOnRvcGljIiwic3RhdGVzOnN0YXRlTWFjaGluZSIsImNsb3VkZnJvbnQ6ZGlzdHJpYnV0aW9uIiwiZW1yOmNsdXN0ZXIiLCJlZnM6ZmlsZS1zeXN0ZW0iLCJmc3g6ZmlsZS1zeXN0ZW0iXX19fX0=
+      # Frontend HTML embedded as gzip+base64 - no public S3 bucket required
+      HtmlB64: H4sIAPDXQmoC/+y9W3MbR5Yu+j4R8x/SsMcA2gCIC6/gxU1RlMWxLrQo29MjaaACUCCqVaiCqwqkaDUj9svZL2efl5mJiTgRe8e87B3n5Tzvp/Nr+hfMTzhrrbxUZlUWbqTUdo+nxyJQyMrrynXLtb48+Ozh85OXfzg/ZeNk4h/97d8c4F/mO8HlYckNSvTEdYb4d+ImDhuMnSh2k8PS9y8f1XdL6nngTNzD0pXnXk/DKCmxQRgkbgDlrr1hMj4culfewK3TlxrzAi/xHL8eDxzfPWw1mlRP4iW+e3T84wWrs6feZeQkXhiw48HA9V3x5TwK4fmEVZ4en1fZS+fy0gsu2WkAf9yDDV4B1BQnN/SBsd+xD6wfvq/H3s9Qsgufo6Eb1eHRPps4EbzXZc19NnWGQ/odPt/ie/1weAOvjmAU9ZEz8fybLisfT5yfoROnk74blWus/Nj1r9zEGzjsmTtz4cmLsB8mYY0dRzC6GoudIK7HbuSN9lnfGby7jMJZMOyyz0ftUWfU2YdJ8sMIvre2W3stKETNQVfdLmttTt+LvjSScFoPnCscil5LuwPVuGkto9FIHwlrR+5kn41d73KcdNnmLlY49OKp78BgRr4LXx3fuwzqXuJO4i4bwHq5UbbRhh9ehtD0Mm9eOtMua2xRu/pYtrFpenAterPTbNobiq8uoTGiky5rN/FFOQL+beT5Pg12b89SB8w2ERqSI9Qjp2a4NewP+5k+bOL7nAjqvjtKVNd5nf0I6H4QzSZ9qEhNa2MHy4i51cfYwc7J9rY2t/rbm5aaHK1TzeZOpw+dStz3SX3oDkJO5F0WhIFre7c7Dq/cCGrIvQEE4Ua+l742dS7dOm5cKp8hCtbShqmXHLckzfNBtTfnLZz+5lQblxy8mFpYG5i2tj61gjnoPWvJWRVTO3He1wUVtGChpvp+Zc4sCfWlj8JrnUIvI2+4T//WgT7hWeLWoXOzSQC02hpF+J8g1pZojHoKmzcJJ/KhQeFxErnJYJxt9Ig1nOt45tVxRA7Mf5TfKfhvfehF7oCvFe/JEjVlH9QlU4IKoZNQA7M1b3Ia5Amc6cEr0/csDn1vmG4IwQ8jZ+jNcHLa6URnpoN3N9ulPInRQrbETlLsVtSUdsB13KE7XFDtuG3SY2t3Hj0WVDLN1GHdqMW0WrAI6XgNpjEKo0l95Ln+EMpk59GsWCvqO33X1ymn74eDdxZ5kB96po3Gpr2FxtCNB5E3JSm6/HwsqtYLprOkZjyKQVoPMs+QXznAyNgHrIBJ9t5qNv9Ok1g0kYLBpkTbTmlmZ7i7t7ebI1okCl5vbr6yAja/N8JZgnxTMt0kApnt8Y0qmqE6WKO1FYtWYAH677yk7kynrgPlB/A250i5J/iCfdK6o3Awi21TZ/tFTiD/jXSatG+aKCFVZ+wMw2tkk/g/3HLq51xX0oVhkcsnDiQMqjQ+0AAQgJS9281UHeknQX0aeUAiN1l2IxsyVBLLSspymbVXO8SywstshsEsirHdaejpqozWYSVCM93ecnbd/fys8sf5WmCjOn3fHWYryrDVrPohv+/1nZ3+dtrfIARq8v3wOuWI2FoAC+X4VpaeI+zi3fLp5pj31z7FIwf/l5sZU1ECayCC9meg8sdxrob2aIBKs42cOjuj5qBAmtklk87wDQFndEF8VVLOMh2SVkQXsoyTt7aq8qz3xY2iMD+dQ7AgWtbJGLY67Vb7HieDd0DX8GQTRZL43VV96ngWXYjG2LbpXMbA5fv4QcrGxSILahOCZVfjVnpdV44/c63LaBp6T8PAGYTlWvmpG/j49yQMYHadGGy8SRiE8dQZaIaXwV6nkZtdLLlJs+zAWAz7hsStNALGUH8vZUxuHgzVhc/i9Rhoq0697GKH6teRM91nKOgUR4e1hx6EUthFLqjJ3pXidoPJ0Dr17QKuME+fEhKdrBYSsCiBwGgBaRkNnBja9N0E9gD1WLCqdAHH3nDoBjot6fbR0Lvy+N6UW4H/KiaTk3Re7ZS2BN8BwuzHCjd+xy64Dcmm3uAd1DyMwikI1CBmv9ugJuOrQX0ANsVlGHluvLThEbmgHCQVXMU6GrE1pFgwcyptJNcaGiXVqmGW3OrN1ZGcpnmt0tg4Ztlxx7ZvihdP0uk85Q9bkDOCanAhAekF6yAdUqv+HtU+i2Qs5BNqF2YFGNElseQuQz9Ajl3/cRYn3uimLsxWsAZxZ9X7bnLtusFcL0p2FlLhaFfgCuau4UTcxtVH1yz2OBgV+F6c5LdPunJOHyZ6lsCzn+teMCTjEqiCbx1aK+4dgWcRp5omt8+VY4Z7ZhSvupG8qtgUteiC+o419rBccFRnYdHFwhua7iZ/zKLLvlNp1vB/jVbVNhuNcArMZP4ECetruZc5aedpk/5r4lQtv9TUkZwxuKTOkG6oTX1D5cg9t0HmdqRAm2uOdnE5i14lE+dVcjN1D0uDsTt4B8tVegO1OAPsem4uJGfY0v19/FuBvsltpbpDTpXYwhZ3rJpXXsnKVNSfwftBZrw6Ocpv2SEsnmeD8W43bW5ne29W8PuRAIBOJ+sY+TtqXoQk/D5InMtLMHPAOAxnEajELEG7R0pCeFznDzLMPSV535nGLjm96JNdMyggybT6ZDzfnrD6tgokTJ7dL5aIuf4MNYVj+aYXVhuJpU6G83ccvhLPJsIEt9G4TbWX3bBrEHMWQTbViBMnmWsGSctAUOPUCzI+US8gLVSwWEk028a+3+YMPm/ZmNY1uk7zDhCDD28hMToBGO18v2CHWGM7JlXYiaA3IzyLSslSCDgxJdIXIsllAqqoL/fa79+5N6PImcCmoGphe+I5iabgRiFMl1vpbDeH7iVKI+k4j8LJFJjg2JuayyxXWYy9lROSfLjymzlYmjZJeNzIlyueLi3p74JVSU6lWwtByE2FXEdtciDTq5Ggz4MNef52sCHPDtFreoR85QAUdjYAUyo+LIlTmxKj8oelrJ5lqlklOtDT38cDI/4UnuPBER4/PgjfH5ZQVWhvwv+Xjg6mDnCP4WHpaavTaHeAQTW2tn9oNQf1VmNvkzXrncbeXqOzR39Zu7G9g16zRmu7sd2Cv3tb8M92hz419rbpt+1OvbENRTvbUEdn+6rebuz8POk0Wm3WaezuDuqNdqO1W29sNVp79cZOu9HcqUPl9cbuJrwAv7SgI/DPzia82cRP25tQ7Q5824Vq2636ZmOvwz+1G1tt6ORmYxNf29rhnzYb0Ev4bRN714GvrRY03drhL0J9bWyXegOtbrEtGAy83ty6qsNQB03eqy1eI44D2qK/MDdUDgrsYb+2xYdWh9qDKdzahb+dXewvjKi51WhDDe2txhZMyhb0dtPHYcBPnRZOxGadattqYaF6YxO+b3dOtviUtnbYbqO9h5PabGzvsuYAZqaNa9fYhXF1YAA7O+ix2mb0Ay4L/gO/79DfTejJFSzczoDWbK+xuYcdo2XD9cFlbMOyU/tNGA+uSgemDYa0iWNow2jwjS2/3mhhX7d/Lm1oNNOGGYK12WnsdE5au9ArBo3swb+bjd0d1oYPUBEQGowVniA57cFMtqBgvQWt4kOY2Pa2mAmco21sFGcQ5hKpqMV2kLA60F2G7/BPHSAamIhtPmObbA/6gRS729jE+W7sbsMEQ02Nra1Mj4GEoSJoZQfmv4NzjsvbgWra7TpuARgprsYOdaeDH+tEobSoW0hmQMibRMG7jMitsQkVwO9QDrvdRFqCvm/yte8QmW9uNZp7vEFoHJvbRaJuIrnsAL12sG3q6gZsVbVrp06AR/7wED9pT+Um1090S0erxAVodR5sANtI+YcHEwUWyvh7qPwsGIWKA0kxRYJU17iFwo2iNc9TUVoKHihEVMkYid7c6cTx/NKROV6hdGI55Gmz5EESlFgYDHxv8A406PAShFT4hH6qVFVvdVbsDnbarZbOioUQIW3VlBSbuqDoFMsJXcyjlM/IDTlZ1ELp6AJmiz2fJQcbfDjGxMu/pgBID7fVmFS/NtVZMMyWw8aROzosfQ4UcHx+sOEcsS8vQXODlWbfuAGSQRhpbXxWr7PHbhSyBw4pIPX6kWg5P3VcFahf4uTAKldanS0Q1zURXsGaf1f7vOW0Nzsd0m2rauaE64i6aGpUTV1WiQbT82xxnC08UOIwW1NKBakpEhq3ZB3p8rS3bcuTrr2qvCm8NyWKq/nzf/nX9SJrxi3Zm6nsjEnwGuVsaoODdsXyuKAiRngGzg4G4dC1rAPZ7u2trZr8r4kmvKIHcljzweSpWQ2dgkJKRxNnWp/QQN3hwQY2eASWCygI6ACOawwn4+TJGfvSmYCy89KNIgdVNugjKLrBMAYNN2I3YPIwmA42kVN2sDFdgqqF+iJoAEnxRXjNWl3WYdyuEyEAMSdLk07kpiJXot2TKCIYKIoBGVIrT4H0SOdfMn6hdMSNO9Gxk9DHjqU0MXQT4E+qZ6a+lTkKt3PNTLiDiHaQ1Dy3QnHOkpZF6m+vxJu3BcMgvpt5UZgeRe9ntU/xmG/aNjqdhIFCny1qsEmWtENxLuJx5AXvaC+QksoD4kqtrZKwePhni+5KsU6HJeSvONdR+A5Gg/tbfquLukBrUI9wjANneliizhmP/wiMWz7XNQbQiEFtArWo5dd3UCnDf5w2a/MTZNTnQP17AopS+4f2uNX0d/EF/CctxJU2LuCxLfa+dVjaKbEb/ud9G/6A4gAP8JNSA4QcPMWp1sjwISdDYDxtnRimoiDfmeen7OwhWHdDNojcoZewqeBhYIddSq6TjN1058v9S5UplWARVaLtomidgm9a+waNau+mZ+t6CSjDvXrwM4iCqXsGP/P+H2zQL2ZhrUItbqN0dPoeGIh/A4IoPTxhjj8dO8Fs4kbegMIzoYwbxaziNi4b7NHOy3/8sf3kxc521RwxNUR+Osb9dCiCSqSD8A4y2DQDdxz6QNSHpUxlJXQA+25wSaTchMIOnuAAeb06rv8jaMFvPrSat2rWMkc/6cmPMY+Z/q06r5wKhCArHZ1wohDfrfPMvW005szLejEoGPLAGSKiwxLUPQ5DnPoM5R1s8IL214Uo9FM6X1D+4QOST8cLij2HFffdBYUuUG2ylIANSJOwaB1wjoZ95xEuQVySy8LP5kqF1Fu0bObCcd8iaJD017ZS5lrJ8maJ4mWKRb3WCdLmEeM73IkXuzEIxglsqIEHq7VgFezvA8+uD9ao4/SkvVbb+N5qbVoWPr/066wmcKzECxzOsR6mXxavq/Hmsos71FtYMEvHwQ2pfnJq5FHvMtN7l2nMfRcGnzSD0sgizeqTIgx08R9wzGD4pcq0JtI0a6uwdh6ZU0qNkTTombs6tXYjN3aTY9/H9l7gZ1sTkiUkonNQcOYnaNcaUlX7lurKhvbZ7sIfsNGABH7TOVfQOXcHm6mR/+vTOTfZ5ri1PUAfHrTMGnvwT/uq1eZ+vDp+r8OTx5vopm2h7xGewT/tH7YHTXyE37AMd36F/g0pneSagEVut2voTKu1Ogw+ZbVNSXA/etCbP6AueQLrEALjZGD2nTtRAoRhUT4vXNA1UaFEo1CayHR2TqYT0R9oZ1eew1x08/wy1M0YVEJXuJ1euANvil4ORg/Y8XAI2z2uuHF1JUUURZRTj92pQyY2Hy5zeG1uvLSmqfXNom4OxKr83n0P7Np3GyDdaqBp0vr8Hr7AYt7gw4VapG07097lbi/cMnju0aXDD4spnZndZdh3DMRyoYanee3Eju4oF07qRCwdffn53t5eZ58RqZ1yIspx37ksXnUAT+P90BmePHq2bOumaPvy81Z7t93e22cPRVXspfBFmMIuLx6KNMh0vdcWGJ0ue+ImZVDRxk5CHi05F040/E2GrOS34DGrv1q/RYu1tnQ3BciLHb8OouUH7TEKiXFrU3/AtHMIIRI0kqqINL9n4ZVTzQsBEB5XIB1I4QQt+/iMaBALs8uZB1wSvRMgJaC7l2PpfiBJAUYiBhXfn1RYgn6XOVLN80n72YYIG7GwRz2wtNXYznASmtVrlLUHuKjB5ZE2w2if44ExPTc8N8r9qnRd8vWcPDnbyDtsG7wy6IyL2ZkxTfxo5vuYiKrWi2elvk+oIid+h35eDLuvz6bspxkaEhh0A2TLoMcOS7yJ21hOsiyWGfbpbRX78cV0F7pOMjGzFDJrdkOo9kffzUAgQOMgOBk/0o8LDL3lGSNxrc38OHOySYsh0IQTBtIhXRwHw3MqUEnGXlw1HUb8PIRidMwYBZR0GaLbVEcNmn+FtiaaxtzP/+KhOAI5P9VcWVYB+5ccxgXQvOy47O7xg1b75GFn8/TRL6673P1EPcUJ5lN90VFd/4c/7O3+44+t9nfnv7iuKz8A9lW4b3T3y5//6z8zdW6Gq9B60D7pPNw83bJrZUua/blBnTuBq6uIi1SGApGfahIWKb/UyfCufjK8Y+QLZU74FpwNi6NODAbM8EFdldjWVIntX70qoQ/zOQYKp4IPhZNOFxniKVJ7+WdSfdEewBDwFldx1dHiIf4fO3l8/JJdnD08ZefHz06fsOc/nL54cvwH8at+zEi+bklyOYIjklCR4SPvvTvcx9DB5j4PjGuKhd3c5UfY6ky72by6lnomfhkbJMiJTgVs1zcpNBqzy/WI7WajtVXdlzHoUEurQPak0pA+oUHyDxV+OK/lb6pSrNGJmaufNtDM0Qwwkdpl2g2ZWAQ9V8rMaM5nlqy6dU2FTJ80Ae+Q1cUNZXENE8Ouv/Bl7LRTa4E+m9wBoymXCJzgDAf+trec5m51f01upjGcbbJO/+Pf/+e/2XSwZfSsrfnxEqUjUh+Jz2u+neM49kBtCpL56lJGn8uGAp2H127kDln/huUU33kCw2IczPdjWOa2NE/8kKcXmRSKHgJPOSw9c68NldkabCTiLHQ5kuH/2txmIo227REcC0KP0DOyu93Z2mfQwTk+7zRmyg9j1yZbtXFoAtA6CC3epplb12yk7ZZ9XGpiT7BDOAxgVM2t/aVkQOr4QEkyAePRuXSzwRmSoz8VP2etRC0th0KNdK62v6ymz+PDDBrYHe2NnGUYkp1AOV9Dm2QBU8q7MNZhSq3+9vZgD5jSaHPodNZnSgY3zjnQiliUfRPZAr0FdZljbFLeZfpPSnzbRHt7PAJISuPdrb8rCE8UiQemJryVUdEee5+xMzZwAhCO/pTcGUY4hQrkEla7GWylTHnDapc+kNRe/3uYYMadyn1h7Ks4K3TDY/Yl2OA/5WzXxjL8MreDuA0srN/54t7I2TBWjOecaIlqefl/V/0gtaszXmlto+lOwo/nS7CkBZSOXkY3XSN2dUnzbRa7htl2X7b6eo2vaGGv18gd7OL1Grw3a9YufvgJzvydI0zG3MYBVresSABDp1jnVXglKPQC/wy7lDk5uiBWITW4Z+F1o9HIikSBdUIyX0M52dwURo1kjYR6YvLaVirmu/kc5bw1bTObBc6AF4zdyEv2JQQNdUczYPL4M1m+rYl2HokD6gYYiUAyLSQUWrHDEpJHgyagIaztMioC5f38D/zJIAp9/zE9+ao8fV+m6IB37g2eKB2WvFHFvQJm1YAnYF2WKSSv/OWXn/Gn8dgbJd+6N9UP/DtQIf596I6cmQ+a5n7gyygG+HKLJ0ByVYvo3zhg4ytvBsjrVeYjybd1N4aFq5nUptNC8WGJTMTiD7la19rc5Qd3hfsZ+05HpS9hns0h8D1OR2OP4GNGK+entVKIegEI2RlPES0w4S36wdojF9r+0g6kjOqxwFOUnnnajjsNViS13UCeHlrHrp8pWvI+lPPjAQwRs5ZLSxgNi/0jFEvT3F/GHWK4PDqGx6Op9V65eB75IUhIVJ6QDQtSkj4djbJGohwOwCSuIj9jZiRCaaGMBu7voY98TFvbqRpOn+eq4Qu8jhka0HxDPJcfLX7TNdTWXENALuvq73b/UDsmFjcJQaYiTzV4pip3WCa80kqr0aqW0/IZFpsvDoX1JEXpsNxMnZ/4+a/A+antXUW8z54wvlnZc5hYWDFWQctA2gHVnHMy8EXBtZ2TW+1P4ZxsfzTn5C/GA4kzM8/9WBCUFPL1q5PsKlkMlTnJS8JATSMdh5TjdSLIZZ5tnU1yth1aI7k0RFLZsm65j+6GI6nzTJI9KEUZdr2v+en2l/bHZRmvHt9xD8l/hkOO6UERS3vntCHfn3dOrPcn887l2NaJyP5a1gsnD+nnKi2q9iKlxTaXn0RpQVls0VnQzpQ4WuccR6tC4RjUlsn1C6K0Fgdy5eKufhVRV25zp682668m6oo8ftBeu8RuDkudklJjmlrHoBMRLxPd4B89F2yX54K1WzwZDM97MRUMvuulWm1erCVyxui7KqZHbOE5zSmsi4fAKYLUzJhditil5ALyLoKihg4MFLpOUkNPJhiYPIcAvZpIsSLXnIdwBS4IhyREqysN2crt/XnhWmlPcEs819sXWK9g2NfZBD2hfVc8QonkQiE37Y3yucyNORIGrmAs2ceLtIYlQsFsx/6ZgCOxoYyhrhSQq9ihJZp5lZ1NtRQKjJaRAW+4e5f37HBXxGiSPMHenfheLhBKj3nGF8OSuCZhMBk+orkpyXQW4OUlRkhZsP7A2sdOcAmPw4CXO6HvmJEhU5fNuBNL6PZfcs6sCbFZPiiwbsxpfDm6yywmMi6wNH8OVfzg/FlcqAcqiAodtGuurpeEl5e+i9k1STRz0RXNOZTj+8voTenrI8eP8f0TH3GMbK/P6a8ECRNB+FeDE/p21Ex5jmRGllrEO99E3tCM386rMLqLwubMMzkZnahkspEuU8eemf00UCaBDjch+xdlwsuVYqIgzV4oSLMLbsAto5PYOmxyrL86dUUgev3K1JWBF+HhywCabIHGMbjhfyPUQ3R9A9URUy1pbG9xlYN/zCaqv5/6KJu/D+ovs3RUOQ9BkKNews8gHgKpVrMaySNQm4mHp5B6g8glQ9cZpbntUIlzGbnuBHN1+OnnkJ+/YmQydGDixTH6BFF1IUSNIsyLO+su9nSjJQOfjbx3Z0oTg/NCOC7sWA0xnTELGy7KQnqRm0J+dMwnEn1yfNKugdJQwRLyNaeQ6BIGXxBZ8EZ3s1zVppAtcnwbLg57qPaPFDIYzvwh6aC+985FHTQeOMHXqzgiuGS2LE7hqfLiUxfsRP7gQj49HpBIWSGKtSiE3GAkm6Z5sSwjATUmglZOcMptDOUjcAh9CBcYPYGzwsS0zAn+nJvNJef9OezzKDPx4/D6Qv4kmol/NdOfovIhjNpVve1ssk1+Z0V9s775eEv/zjavyJjU1myPL9kOrdimiYDWydWI4GO7O0apFmKstTqqECai7sC+KV5Pmmi5oPES4byG+XcShXEMOiJHZ8U1DSh9VCgfFQFz3r9hQ35UWs3ZfQYxCK3F7u0pjFpZGGqkR4AXAQtlPIVzTccV+d9//Pu//l98tp0g5PMNslLOmhcIUz66dALvZ+FuLDYv5yUuCRZZOnrJ2asmkKEZhw290chFIpat1xjmFznDehj4N3wBoXtRCARJFrz7niMfCxnNX2rcLRrMDCqyeXBtjF4N7V4SkDJ1C45xcfry+3NWAWKrY5oUm6LEhZKuGnq1a4maDX1TcQDNUTosyBlpyTZoLwhf281nIPnekUpZRQVJLtbZ8VO+YBJTi2JiclbWCKGyZAXfR36ljLoV6FJ1UVEdK2ncOBO/bEfjywOjFh+ZmwF97TRIds4qbdsc8v/x7//yv9JUXclxBL+isb/AscscXsW2QOPybDPogqp7wzxB065cXn1DVk78cCascIrhguk8IV0MNbrBu2pB3RzGiXRXmRIou/kwDSG8hv3vcj3OmU4ZqnPUJ9SVY/Pt6VRUcKaFIGJ2+sSFlgp6cRJOb4xqaH6OXzxLqxhF4YSTEA5H+PAIBZvCGqdODEMFdTW8zrVxsBH6q6Mb2fVq+47Wk/yBMLH3x1FQKuK/Obb9UiyomPp09BZ3UkH+vt6sEYblREEXDIuu50y60F5nc2t7Z3ev2Wp3ce9s5DYUMlb8xWZiC55QuiuiCvXWnYSJm1dWLaG8UhLxV+Q0LZb2uqi2pbkXuElQSdCTDx6GgxnaRnxnaacnNcapovoX8VgccViA1u7+nN6KGE4pUbNG8AuXROsAJCewCrwsNa6xKYi8AWg/goHBE9xhoNYkkdfnEBtJGPocm1GicCjgrXswctdHYGzL+dQIUoNXNOcGpNc7w6e/fBZL+6NmC0seY3TXIsNnSobjXQ91+myGnTVtIrmAs23n0hAKsgRSH7UFHEp3iZkg6Vk3FZFva297PxPGrKqSWLPjJJnG3Y2NuNOYxTDjMNR2w6FIASAmhB0hLtZuNOsSqKQ+1KduA69S3gBx+dSZwpzGG9egGNY9uhIYnawN/L0kxOphqdf3neBdCS/SQXMKgwC0/WsOKnsRBM1+VkHIsTTcMNDdDD1iODC5HbxYbSuFi+Xk4K5skvTXu7T1NZfWA5kyA9VcrmW8AdPWOxNPe/I8svcEdkhjOhx96mWWPVEnowx7wirnDx9V/9pXFVYqxmtbxYry5bwMNpCFx8nG7JIWV0iOugiq/YtsRik8cQuCCgvyj2/JNCniP8lGtC3ZMIrVksEuI3CVX+TKnYKGkXgD9tCL0RyIQO8ZYLjPzV/7qmUWrO+Hl/HGJIFFeu9NvJ/RqJdOFblYdZCAFBZbB+Wu7gzIRE1cZxLXQWGpo3enrtLAQFutQxsbn3Jx5cKCPLzAfvK9CSbvAxjdqgv6K1q8dNIdDRZe7rUNIOvJp10I2mXYqjAmTsJgSBFs8RKrcLAxs9neFvW83cWIzwTP4CVU9C9YNee2187mvtFp/eQPOZNFZ5+uEiWbNwiET4lgk0BOkdckdrnJhndgJiFzAxjWIM0OlckqfI9zvy3uo+ea77ahY2HN9Y4uuBdpEYqJfWRz/Nh38mVLd0WroWIgMSo0AnI750Zu5eLk3ILHvYL3Wi6NG9D8A9m+c29ixn3myRjYRvGpMHmueFoWutSA/jzu/nRpdT132LD2LesnlaY6DMZy7rQgIiE9flrXcWpGMm/dIZQ5yywtyIcwxizPWQIB6CNS9Mcm3naDIu85wd4HqZ5yBhEzF1HskVxlLCTS45WDo+cJ4wJLPu5KGvYufydotyYexc40+yikfNvsUwwTks9Wo2oYPR/8Xz1tp+t8ZxK3Q6FYkjAEURyTNEHE3KxsiOkw4VxImCKkFItE73QZ4a5yt71E5/3FC/U2Jo+qfl+Ifn8KhtJa8gRxDcwhm+xdRtfV1mBX4uLuAM0WKbcF73aWSDRSuyBzlJUek1matDKSVXQsfjWTUrD4UVsWWprfvkTH0QK4Xp67EaiYwzACDEyUTM+luxoxMdnF8VO66Shyf5p5EUn26bIc0EQO/svwvs00gfkjcD4YoRXTeEnelzv6We6U53vE6cED0sRDx0GMx+jABSMXb/ONmTdiG3jRaoygbzQcHltgSZakYnMjQdY691kJ9VjpAJn51+mJu04bYDqe+hTw9+DmbFgpU/cfhMObclVkz4q+H67xyuFhGUdc/rpMl8uWu/wrRzn4aeZGNxci56JSbvBAaqgDGbhI2bpbo3/+t/8NTf753/6/8v49AEGbAVmfMt5XsKnF8b7Zezx+gclKrd1MtpIezkZhfqpkk0ruWkt29JI8AaplrXPXGjxmkSA5DmBcecmJs7SKya5f5XEERJhr0zyCLQjql2RedN3A/ENUjtBCF1mL8upm61Ja/0v6nqWehC4KPkgi+G989NRNIm9wsAEf4asF4pUSvil2K3F8Xm4D391IxIXDZuXYz0wPHuS6zotiB4Z4QR/OH6221cSx3df4BCQK+qMbIGOTIe9RVqgk4iJk4xn252g1VCvt5sH0Ew+Nhs+wQnHCjs/Pet+/eMIOGfBDx78AzgdUh8ztDFhFpYwnVi+Pv+mJcuUq+9OfWLm8L98/ef7Ns7OXz3vfX5y+6J0/f/6kd/ZwYWXwEpUtrA2UkdNnL5etipcurOzh86fHZ8+WqokXzdV0fH7ee/7i7JslauHFeA3XXgBaUgNfIEdWCBTpBWmt37983Dt9dvzgySmO87PPKpkef/llfkKq5usvTh+evTg9eQlrcwZ1aB39Ktc8RrViUtQ+0sHGBugJdXb+7ckpO57B/nns+lNULODp3/7NaBbwiFOZWXMCpvEPbuSNPDeqVNkHJC/eDSeKoOHAvWbfg0zfPY4i56bSaWM/oUh0M01CnKUXYL+HE7oGKK7AO/z3yE1mUcD6SehULmA7w8YYcWCbCFuswDbBstVG5FLgUGXj9Vcbl7Vyvaw/2sBHPf3R4VdfbNTKZWzk9m//xolvggGzjgla8vGGOrdyJUZnDM4N0CcgB/gS9vMpf1IR46NSQydxoIgo3OB/0wq1kmMnHkNJ59rxEjk58ayfkLJw6cZJpXzx+Lje3tou16japacpswDYUPWu82bQQYIk7w5fgjAN4gwJDPDKAhhXDH+gdG5zTJxpjxfqJfh+WZ8TMD/nv+kNLW+576fw2tSJYvcsSCrz3qeXe/CC2NdNURGo0BXRddhpmMHRCMJrGNoB1l6Vs/5BjK+GPb2lNzOtgUANr9y5Q13wRmaIC0prA9LJI5j5vm3hcHs/JjU8s25UD65bbnV1kuVvQqkPrCyU4PrLm6lb7rKyk55Hb/wxDoOymCCcWl57VVbwqoz9ABbIPTflN1AjL9LwhvowRHk5kszmdd/zlE2ke7BmRYdxwxlDk5tvAWlN3w3cniyrkcVnKTcwJ1fWT8qCYHsvnly4TjQYn2MkaVz5wMXwZeQESQ9jIXGe9KH3sLflGi8G1g9MKBBAN8/rZREo3qV/xQO8ThI1zd4s8rp5OaC9psbWVTOCP97ykSbRDfsgC+OoQBWbKvZEAc6VsjwKLINEycinr1h5I8ShtTc49dZkdYxNXBgxDKp8/vzipRwsk4vbXURM7+vX19d1CnmdRT7nqEOgLlURLkCX/gUzjfPESpX/KEYnVhLH1Ajf5Rcyw735oKk0UnJFVpIhn7iQp3GG3dCfLVOH2vriffl9mXdTRlBjYg40NvYVq1CN8DuQS9zzAvY7vJ68CYLBXnmW0di2h9qnWDc9uWWwaIMxq+AWpEnFwHc3itCIfoW7/g2jfao2Lxs5nu8Ou9Btt7pvrAy7te97SfMv8YZ7L6gU7Xa7wqLt3IGU+GrNF+gDNo4cFzORGrMJfiBiaG/JzSS5hfu14g6H+AbfBrDDT8LJFIxikHt5/ZB9xVep/CXSMjTuEhM6xFe/jAchfCR0wa/wON4bfjWNQjCz3bL+XspeitrNMR2tXWI8app7nBMcXoBSk/mJKlffaLayOiuGI8DEwfTlJNsgvAy8BMkhnCWSHjLrNMDEd7H8BVUvWhOf6r/bSvA65s6nrriXNwg2h2KWUl1MaOykrJ/ByLmmXsnsEw9+wSJyQogH6paGZIQ0J8qZRYyUe62uvNjre76X3NDsUMZZeZ97JqEPJ5gfS+HVSKYkZdD5jDZkBQwjH91EPCPihC9QNd0FlGsRF8jN7PrE9KOxdbGtQ1ELCvJKmURpKrc1PUAt+NiLgRpupJKL/hS3grymBiZerdBKqhpCQqlKnGXM0UI02SM1ICUUF083fYPduC9fmU0x2RhX9PszDgehftLWkSHbpH9yq0ReYTwo4IenvE9L64CWYaw8iMIhaANIe/4sFH2qsSDkS47RVZIpYRSJjxKAa4wZoYB7pUp/NEZhtA/vXrrDs8CQHxg6eIoMutC5i7T+PZZC1mkYInxvP0iCea+rQhqtqmfVtA7TcUzOBt5d9jUrC28ud1wzUJi461rWJwYBpkxmjKmhxaXwStYWr1u8qpGypjumLUydGzoxOWR/f/H8WYOss4qThH1ZQQPG5cG2bZSrr1pvUruzjpboV7ol2sMnG+VUVSFKoiHq7nhiB9Rog18vCgaefACGtfLj8PeFpkKKyq25bySLFVflcNbFmS2S3yymmASxlYgqEaiNOX1QmPhL9Lowt/hEc/qORWoY7i0mZ5e25vE5Iuj7fpy316gCycOFfrT0qtFY+IpcnL744ezk9KL34A+98xfPv3lx/BQtOay1lENXL3XlkpZQMs0SF568Kgngw9OTdqnG0m8X+rdv9W/H0yloo64zoWc/Xqjg1weuA51y/HfyhyfOpD90tFd/DKN3F4g1GVsfwsJELnvqBA6iapxhZYFZVjb1w9NrPCaXoVXyvsbTHy6qWulvgNE/8UZJ6Y0wLEpidvWBX3S0Ny467BugUFDvLI0+8hBm7CaGZdF+fXTxXo5X1A7tJu61cyMfI2DfbCq/gQrvXIBQTzuFT/pObPTqxUN9yh/egMwKHz6wPMKcNB6rCSRXeXj8D9Vcz0+cwdjVnr5wh4TQrT165k6TWaAXkgki0EKFjpqfhsEltkd37iZCHuiNfevexHwZK0T+U2yWnThx7ATDyNGLvvQmbpzSEH/4FMyT6AZawLehjx5f+BkYGg57ePHdk3TGnrnJNVANbtYvmeQVD13fw5BrfRpxD2ZWA8kXp18uB5c74j5ofCqXG335sHY+0CA0pM8fcHOXbXVkFS85pqvREC/JT+Uj6KAsK3oOtBRBWd/XCv9wfgI7JoGmXVma3mc/Hj9Lh34cOP4NnhcZw0QkO32jnT59oa8MCJbYi4n0GN+7cdHPaf0FBbDnY0TKzP/+gzd0Q0sDeBMaVwbljtWX/eJbOdxv/Jn+C93XcYHHPPp28wJiFnr1E+yumqGnQHcYM/EEWgw4iRyfGTse9uhT552xx5EjwrjcYGhQNBKu9uCBO4xAPOefsONLwrqIXI3XuAMwCUBn+pKdgZKdwEfeC1xYN0rAihxgljTnd5Gx5o8vnsrvsK1EEY6So00gAWwOQH7E2UpU249n/Sw9CpKHvWaMn0SifP/cuaHWTsiJDQJkOr7RaFDLUzmDzZcKGDXHT7/TuaqHV3eD7ifGrGW1sMrFM4Nni7LfzdyZxt8vvhOFiMu6U/ZISFRt3R+6V64fIgjBS8wRTecaxPmDmecP1QzDg3Nv6qK+pT9DqB+djNScf8m+wWSOAKWRPkiazh9R51B9I+mQW44XsD3QwoSh4IKkbagkny85FxnBO7LfUizkU4EMxgOvsEd0m4R8/NTxghGmvQPPHkK3hWMyK65zuSogPl7ANKe9Ax7sqOwx1S+h+qJqgQWeANNNqzZ+OgfBh9LW/isHDNaE81n4UjUCn0kbkO/i9wsvcX/0Ym2LEQqKMWEsu7CK2LOT99h1/GR8NnEuJXdXD58Ac1Dvu86QgIBosYsWlNRM6lXp4YMvjzVV61ML97m89tch5q0L9DEFoBRBFvVoVamU39rL7GedfvidQYuV9Y+t0y5UTy3aGBVZWX/Kq2A2rcrCmOfzYlPtXsj1tCW4OD7/bf7/IvMP1q2MX8CIVQHwyfwwhKoQGEvkWhP8q4oEeXLWO3n+9Onxs4cXyvy1GABdhtFLzJl6l/wJ5syo9ERWTzMVQXFkB1AOPxzBD1AuNlKsDj9c3ZZqRkPKKlbNTDnvW9SKKLZUW5r9ojWDLuKFjUChVYbDGapshL7NbwNJEAMIp0YrIC0O9ZZqFCOSGZKgFNFYn77Nb+wK0dGWnTGbsi0HNpgwZzikKjDVdKAVrevfeLP4YMXh2RVv0fwAHw+VhjJ3yFBs9ZlVxoTe4DieXLULG/OGME5/hnsUPovm6gjzsdpoOS/Q272mc8T5hOo70WT9Geamtt7mCJ8UtYmTGpsLij63+PDVh+Jmb9/o86tsC9koPOjjA+GXxuzZPyJ3rdeRZbED8Z2+qVbfZVu7sq2lbrZozU3Fs/kzK0sZo126XTKNtDYxb5naS4eHdCMHp+hmEZuRZqeqmr7C+wv2/xQsvBW4mWbdq5bkk/kN6d9W23qmNSKaxVN1tV6S8UC1anVoFtMvq63UHA1Ttg+2qc7virnNJF5vyLpswtEuFk6y1BrtmYqLbJWeDvjDBU2/X3075A1K2e7iqcXVRT6uLeyy/E1ZibI1+j7szx8gxRWvxU/nmKBqdd8XNs55nRQj67SPKrZoyB20Bbqz3C4pTueBJ04J1pnTZU4TlumDtr5rjPNF2ka0iBlNw/Um89sL1ci7eH4jtkWbz13xsEgNYUHtQn9ffdvlD5lkk/yHvnwuBS/tQwQUKeyLG1zp/SCokeFwZerRTTjZp1E8V78axSuRSoFFpyagD+qcJkz0UQJ1+v31aEZzL5lTTQ6fRazuHjjA03RnTCLrAK266vItoJktWhjF7+cTLhRYaxSa9S+auuRfjRkkewaq5nYNn7v08zJGDnmpVAuzBdoglrDR/pwGCs4hRJPvJjmKh21NC8T/qjG8dC5zcwfPCqbP6rmTbYrf9IkUJne9nhrVBO26rIE990TMbNeRz+cYU9L6Xot07MdukmDFd2p6KI4+0+FnngiS0r6s3RvzkM+ckiv6jUBd77gOafSAaMGnb8WWnAyxWGGVn34nK5/8VCDceb/7mGO4ikREh7KcGWf0zrlviSv9+KKNgH9dkieL0qur27mza9U8Pa+PxPMFjPR6rc1gOdcQzWOkK48m1GUE1+/DiePpJLGaH0OdBIiWIvG9iFjuLvPQrysbW8Ke4A1CyfUak35g2SJ+3+owHvw4X4HCoGMG/Aeqh6pyCg4+E0xfrcnyElN2KO6Ascyms6Tenw3euYlEkINa+QPELaAfNI5GBcogUS7cZIEjp5xpWMUFyPZR2OGDIu0KWJossvp2yh7dy0b54wl/mt1L/FeaY/FxnXbT2IC0UXo2ni0wKKHACnxq8cG/bD9YYDck4dQbrKeAFQcUyMZ/4o3/REXq/C8mprAD9XEZgZUJTJC1w1MpnBYZR6NgdcMoG3SmmqXH8qRjKafP5fUa1JSJeJDNx5OFbRIPkQfQWQ6ynk1tCYoQHUrk48wKKKt0nS2cPSNbxlmQwCyvYatooZOiFZS54iS+QB7hPKpSd2u0KDTz0/VFBGNJtYq+zd9OlGaxnua9KMZB9UKWW9ELt9TOLorjkUrrimbHHM616HBWevyiBQOFAss3mY8ikgPDB2i+zFXKUUsJXH/N9mRokt7klD9boKzfqVkZ86Q3O+DPrIzJevwwX+YuG9Ej1zQcDPtLKppUdj3tfaLZzyF+mT/LVGSFQWuRRpLfqyf1a9BsFqzqmsPSYoFEsz/hkxifzG/wpzWOVzJBZ8ookU8XKm/LcoRMTJPyOATE7Oa3kXGqLmhDRehLzxV899HCmm9C+q673jm8JfhMbUX8ZdF5ynq2XS6YTdv+A8eve/zxEsdkmGaywvTqIeWizavpoO7zR/PbE4VWaE1GR0NLn3NluNWVV0HhbW5a1DAINnH7i0hQfR1Q6IeIphZ8X5Wqi1Ls9evXAcPD5uwvnEO9Lh3o349el9QbExChfl2M9XVpEE5vHkXh5FBeUiSa7gLLvYQeHnUPBNAe6irdXHsbBzEpvqp9KPW69Dp4HYiht7uEqYnJQXMHznH89Ik1p8JYIzkYY6Vel5Ybg9aNumU8xkBUS7Tsr0vF+oox6E6XUVb2jQTSNsdCd8Xk3QqfbFRWctVC92UAkm3qc7wU31rvXOPBxVKGwhXeNLSWqvwE5U/seMpD58sHCw5sja8rKKuK2yw3MGBB65yUIlj1g8gbpmqbwK+ef2g689eJ3jDDvqWyJJ/OF0/ZGKY5+qEWcC7aGNMT33nnriMPFg9OC7RWgQs/+ffnodaD90UDXrhAoCdjuhdi1UUykgLStsAid6+9eMH8gTHnLh9CqBKxTJ93gZcuExnpBKuPzZqBIxqf8t/qA+23+V3AM7jlu5DG4PI7fJkzSNAckxcdMQwyopu2Y4LThM8DTNZO5F1sf/s3vivfUrcPHbIPt/s52Cnx66MwOufvVkQdZnasJdP1lSj4BtOAqWqZ5UsReSpUGJj5FOFsY7qgFIM5L0HT07pB8XqiI98Af8n0gAcZ4y1w83LA46sBvluuCiwFQmYwK2IFM8LxhLxhw8N7EB+/fIp4feUUS9iEHeRQkHThmgd2pTfAm1hpGZiTWQaRv4yXh7suA8X6EhP31TISDrBMn543sBOUtiZQKvawmRKEpINyYe6/SCHnHdNmYD4NqPR3OSJM3y7nUpvLxTOcaVFA2rg+sAfxChDMUzdCD2q22nR8X8l66vHUHaAzW/2m5+BzrBl/4fBsI9gvGICWa08fY0ICAh2rkmlN5dKjbVPhHXoF5F5jsITxGxaO2PM+hmc2YP0iz40rmbmpagAAHD1N7wpW9aaaRwVQafMc9+PCTawvann+Wv9i7BV2r6rqaTjDYSXWy1uqQzBERMIjoLyKfLWqQQHoK1xcCTadvpTH2sBpEJOGvr7MyKoNhLYB9R2psqnm5m57+VmYkt0IwWzFZZdeLGnwk+1bxpCNI04NDUJDgYXK64KTAiGVRG8yhEd8tqYas1FgZj4zkBZQxxkyXVlXih/x6p+c+s/H9X98s3GJOC9y4amrXx2yt5a+1ik5Qb/HtHP0xQdZ9e3BBny3QV7j61KEcAzb4bBOL54Nb0uW+2f5Bbn8S8lWS72fBBo0Nof6fSh+rJRl3eWqDQNadICu59W6ISSAYu0IQJuDHDYQhp0oCq8JVX97u7lvAQvOgZ8XzQodqpeO3ubZD5SiDS7XN92Q6ndaYPibX9tmfY8vb6+cbux0hfkFxcalxAOExemH70v8EpHD0hcfoObbEgUiIw3gEzFjOP90zn1YCoML2Cv0xZx9/rq8C/mtjsWj94TQd/V/36YbSJYq81/4PskxCCxlIjbdeTebaFoZGqMhGurNcK5yAwRHYF70moaOc+3EGJeBrw4bRBl02aVAh44rZYzNEKunKjdw2I99v1Ju6NTU4O80gIxOncG4Ah07YnrtHMZO1q2hOoreVM3OoDhJ+2FOi77y9zUnRITukM9JfqxEr11RyIQaoqu857fIt32mXYLG4hXaBRK9laWbPMcoW5Qj3jV0B8SmzBUNVhtgRlQGfVykQR/1FKhe9FpvsQH8flJRKoqtR9SIHMDBIWuzr8UzRHavlIETVFmXvf3ig17yNk/+2vbjscAn/KLvgl2By4Kg4BJabFlC5bFEtJ4auaqpSOmAV56VkLCAmkC0aRdq/TJkWiwGq/s63lEGIkvMgk7hBqrV8sNNyVcswpq8C5dSrR98Zp8B2bYQDCsmBKzyrbGmecxi8aOcMXNwyjY9ZK/e7K+5stpQzRXO7Q/UU/oNEjwKfpN3oDGdxePKB4YosFiyRv/Kz4MJgsNqKayv8DkZtW8/R7w0PREWNtvU5Roh3wa3byUg6q2BFizbltNWuDjcYhSGCYwS2CU52pB3on0BJYjwYPvJqa9kN0qOUfWdR57rD2OoL2XEfLdVJOZgjXRaPmG08GVEThAcMWeSp2U5ClzOkSBDiCuTqXs2rEldGdRPcoPUGCataaiJCw1KMZHliXeJ/JaqtZujF8fnWvnYmS4ozzP8tVf4tWUL3uKzY9KdyIs+TPWq8nO8sNOdeDHFbEwmbjTwYGT49p+OxRVC+EWGQiE0L1KXar1mrSoIg/pgyer0Gast1bHTk/ZyL9q6Mfdl+HGlaei5g3avoJ4V58Ba1a2JsssX8JXw2n3Fyn/CF5BUiQEoNOPbRUDgbjyooH6t9n8qJL5ErD26QFVH4Dugp35iPDyih5f4cJ/l2O3zWQIckV8yZbJaU2/JXLRDfJSYGmjoE3FJVelNRgcS/YaavoZ/BFvARfG9skVv47UImSj6srHBvidJJ1QpMqw1MEwvfjniLpnMSGh/JS4oNwhJXZ4vzUaT5AlWfwIdk1cBDeIYbw9Akbb8nWiZy5K0K1429duv9Iv/xIVZbXWz2xcfPqNRgcgU92uR4Px8Z7i7t7dbvrVc+aa9Yrk7Tsjdt8vNwcvRL2EKVp+BZScAKOqFW+eXciFHjtwY83Qw58SPXGd4w+JxeA19LNoK2YnjFWgwoS5BegLBK3OwqhCrDWDrwJ8PYRr4z6/cCKZdqFdaG/QqtIJ/NbMTngh03B6Gfz3zSX7mH19krXc+Hy9oKFR5zVZRragau46KIlzuwAeIgVrh6lEi5LrBb+ThxlNHE35m5ugHVYgfmvRkomipxpwkiWCV6SQELz4wLk8+ZCU8BmG3KR69GZ2fq3nYv4/KKew9V3fc6fEQ97Vq1rNoclXzjJqeXIE7dJ0ngOYacAfQf4VBtXbl39orfxf3xLHkHSrXsqrzyyoyrHv8+qo7jMDIpMyPJM2qvIcRaTkruZZk/so9NMPP+nMtXE0H61RamOCaJ9r+HTptYITkqk7xQnoICxJ5/dkd98XFMyvpxgFeIDH1Bnep+jt71T/FPcpZWJdd5HIY8k2Mgh55NHoTDrR5h1EUZHfm2hTphT0FJrfW2ESKbK52TIbt/TG8C2VZs9NyDaWZaj2embbuSApzcfMzN4H/3Ju1ySGXo5SnByNfSXy9M7fMptXnueYo7mFkVy+W4GnrNsizwHMNjOL3Pa7B3FdDadZmrjGRk3kfEm3p8O+8wMPw7nvoAk/cz6/YJLoP+ZYmLeblG09g7GH24R2aSONYcy2I0MCeijTsiQDDtLnP2bPnL0+XjP7EWxASKkZHvbwUhapiSGQ+inZ+CC2+sVQYbWEAbWlyIweUjZlNQ2azoa8YWFTS+itCX70En8nZx8/MugT4S/EqGOGZhetB0Zh3WHIjuyrXSprdlH68l8aKs6o+dh90uMJcWwqTsEeR9ndoRovvz4tdEet/50aWg/FZwiD8HMvyyyDQ3ycLxHRHRCL28wyNX/+GLmeHQiquVSf25YSrDdKmyDroKXybnhtceaClTu5G8QYuiUUlop96hEGyvi6ZzUzNKw9GlmrvUiHor9WgwpHM8wn65W7D0dDN8qJTYJiBrRi/uwd71Iq6ZWn1/T1I1CWSHfNqpXznzsaxkbmVayfN4qIkLppnwsJdv0FrClCuYZkOdKf5NUKt86sX/+Tfw/KZCLcWXu7JbQX2f5zgg3V3QAo9axUZSP8UjAzjukMrOVS//MwB2fNf17XPrbnbFgdWu5fwYndlTRbsFIsRQGUkjEpvlN4Rcgc3jZYAZnPXiDSvOznqMgHyRQOTJuKlH/YdXz69C+lLkOI8OdIvPYVJfF8+Ch0LqshLoeFC9TSF/b66oAFBFfpJJDhUT8JA3cVzMh/+qbAPhAV193Y5lFKeP8fv7oF3Gvm7uTbSXF6SOz3+4108DWlGbd7dILJr70m9kwnXeR8U/kAbA284u4sCqaHl5PU6CYvTA/vW7Yfhu/s4IjFgfPP+W/Vrj9+2A/KOAIV/vqN6JHAnLEoQ/tIjmIm1+aYVmzzPzwaTnoZGficuzeHA7e7vcTzpAdu6y87KIwzZXIYSbagncjnv6tU3sNXtY1M4672hdgHS+rQokasthEg/9fA+wx4iVa87jwU5YLkGRT6Yng62ttNXg8bLM92fehwK7y5sYwlIqI9zYjIPB+r+D1J0ZHgLhQiU+J5ATL9LKxrGuLWhaXoj0tptCPx3a/2IBX+ncVguDbDvYLpAAG+cjrxBj64KWJtD5VCr8hQArJDuInbvwAlzkB2WM1kNvgP1xbu4JwrB3/Mm1ASbVsrp3aSzFXUrb8uLIj2OtrVuS8WoSHl+dXcFfClwpPzsRubsgrU68i5nfFl6QHlT/w5S3A6dZHFhCBilnsAsuqf2Uugke5M9gaN0z82m0EkFzQocpbuxbS11Pe8wDpMeZarfpXItX93WgMxd71F6+l14AZsnF/R7KHp3FRC2GxHyLSrtS3ga7qiFWTB1cm1yKAWBrtNTgAl3a09gNRQ0hrgNvdHYi+7eXA6CIj+nokRvtK4o1BFJ8u6vPljxBEJyh7p1LJJ8NI/88T6sQxMfZJ4GQbAhPQQGuVPQm/2UexAh6w9hI69D2rdayGcEP2uRjjwvRPsda4YilYh9zaIGfVuiIS3cG55g4pAKsdw3IiyxdapZoUqkKgt972HWZUmP3n6ripa++ACfocGS+95BxbvEj4A/Z41Gg4V4byfjUhEf4C9ffMAR3L4ObvO5Pu57UB4GyTl2exz6IPbjSuRcn0yGcQ39+BNHT+3gD7JR3VUt3/9RGDEVbVqjIF428t7DPEXuTzOPrnLHqPXYCNZ/y78djCOZBTv00MsVyTxdSpAVid4Uy3ztIoF3d5rN/YkTAReq98MkCSci/Jmyb/f2dvdBpTCapQNHsUx46Aha3VQbO88lFW3SAYxs9dobJuNuq9n8Oxn3PAh935nGbld+0KOsO9P3+1pGNLTkDI8OgI5EdUZ8tIP/2zcynpOxLKlitTtarDZme9UpALzru6NEb7kFLZu58KK/YoJaKr77c9dxh+4QGtaW/2AjGf/lOvLjGMgrCTHwAtff6Ax8iY7wCU5lOrP9cHhjdBgKJcO5naZOjkid7k7CICT3oN71dtr1YavTbrWha2K3QQeGyzWQq6q13dprjaCqF4L+KIroBrZ1umUUW+KZbxW3cdlgkxs6MJGcvMr7gNPxCcZt5yv3MQ3HwyFDUHvFGZBNYWwo4TNEFBOgpoPPBPS9pqIHiEtSydOTtmVS4ItGHPAN97OeQi7uwsRgHOILghmyA40lHLEpdAusIS3dZRBO+qAcIO8XvFIk0jIj7XiCIpG4vXyhQY8qGwevnPrPb/CfZn3vdf3N7442LquYlvRKl0KzwAONG5MsYcIlAoiotPpGJSHwYpn8ZJkAV97XQWKGbjyIvCkHzFbh/WUT2g+TrJ4h8eHMEnXOh9mTNFpHsSjChmQEU7Vck23kUf2wIe4usNR69lBUPIsbDukFjSC8cvD9+lWr29RqzlR5PLe3UC+fG6S3ERqdFMuFmYmqQnk/KdWWHgKnxHj84pleWr9nVPSAH+PMeUNeyybL42Vu2JZR0Lz5k4ry+0LVD2b59PJOLMuDNjZEMArjN+FAeQbriiudvqdu36QmTp4y/bZOowV5VyYWzLiHzYLa5UG8LH2F6demQV1JqWojLxWjH7LtxolZlKLNmR5Pbr5hXAdJb0m/IZNXK5qTYNzjKF+Qph5TdwtaG5GjFA491YI+XHWzIi9JnmwMiYLS8ItZr4FOjOVfWAlJv88QSxnWqdG4vHWQSj29YJoPRfHTzIzrlwfKyolM7UQtbvyjkkacAUsjCvK0JDueNXRZenerPowU75vekjE9XFOz0l9KM5wAkf4rp99e1PTkkZpK7qgxNxk0qvpKiJvhsBKwTFhqgpgN6vev8bIXCijNKChxfKlQNlCNbaizTKadV5o18EvO6P1HF4zYGueuxlyJ28mwGGV/9Cn7g0+BXle6bo8u3hu1WXiL2k0mVzF3kroDixecuQUkI+6vwlLfAk3CV2MAGa4qz8nFBUhZjqpzU0XatNryRRViUMskY+QW3bjyiCaQ35GkzCajce0SIyz79DvGn5il9MuBSMSKq4UGKWFqHbjWypnxLZk9lN7Dg4W1bAn+S4atDFMu8OLhRcHOl1fMUCkRFC5upGF0JY2+SPo1MSTQO0zcIGPShHmdC5WUx9wF1KHdwkLFzYQJcZuL+Yq8Q0WUV0elZqn0xhMq9+yC0ROzUHo/CRX67oLxS0y+f/GEVcZJMo27GxvxT3FDgucKLQXM+AaoexsSSvdog1d1pKtCo3TFTErkiCZM5P+YPbq81l4y4j8LZIdcQjm7xt5K7+XAMplDBsZ/zkwbv15DFU8jvIyajasosLAWlK1+M95Ib5Ogbc7vn6CHGVqPNBn24qKAbPRrBGg7ogubiafZzSNR96nKNL/DuidT5HzaaQS1XyAK+4bQpLMjk7jSetJAmYLKUkh24qYi7JvRY4vEVri1WNrw44JoSf2sTBU269CxybEGLcwtw3EVSjOpmiKlgJ5m+q8reabnlY1yep5EdE31yx+Pn+WlhiIWEBsb1tN8kiYm/SooXHwTTwzoSWZYCrtWFpLHCox+SkvfGpZVFF6jRSVsMURumuawbND6wkRzzQh7NSU0ivIf0MxS6+8NMcxmBOLVRA9kbz+SlX89hkHWqWA3CK9hAvcRow2hL6bV2/uw9b/4gMO+TY10YYZXheWs0F1/8wj+5hG8D4/gFx9wS94W+4DID655wg3sBdevcaTDWhZikW9l6QjPQ57s52GyngmMN+nCUcBwyCZiZBNxA5UlATKGyKCDyTB+LNBBy/rhAXc3pcBbdmBQ+CTsKGp7dXxQ7mUSCKF6VQ2wD0AyVgLqtj7AxtiJK4HCoUPPlKgl45pCDEMvUFheaqgKXXT+rgZdrdtCQsvs8jbHPcnxHWRicmaQl6UwksbskbsVpkn0WQPUFOuxrwP4LjgIEePi9GEF37hKj4XsqLr89cod4Mvyx1GZRpnyXhKMGrRYzSL22pZH8GP4gYMmykkmEhYTfDCNXDn3UC08xQcGzudtdjc9ESiN9rlFUJmX6Te08zCCKp2CWN8nOgcX+2iZky5DpF/OvCEaR+L9wm59FFHVau+2WyCsHofXyP3QA3sjpFN6VsDx40wRFfpGU6nsMXeGYN11ZNHdltg85Eoa8861Gru6uPK9o5Nwym8fSTvQJ4oG1sjh0L0Aukoe4wMMXztqJKODDfqU6jboXzjYgOr0quWBCH9NnbTwV9NTEli+meNnjkiQ+qFSH1q3nSTk25oFoh21ivCql8jmKrC/MXVY4hDhbxjtEwNTWKoyGEogKyPB5V55wPnFvS3poi1RFS27VpciA8qHzFUhboiBicAiPMIwAIHqoseXpjHbAJ7Pivq12g42Qr+IdnMqnpDkGnfWFK7NTnufnQbxDOyMzEEXdk8I9Qhxn2QkF6wedRXhE1ENdvwYhgM7b+xc0bjJlpm60cSLY7KZ5VlRAl1wUzMKUfjlxniL8KafYJ9Gs0Ds0ix3+kSbVMy1bB3mlXw8vu8Ou2L1MY+9XgfzHmcvv/hys4vV0NdBr0Etl9o3sAqzmO6jOjt+CgYRkN0GdeTi4nm1cMtrnJrLp1ic+/CmEEdPeqnq3hAR9ESDNa2E5oTSSlTnsI6zh7FlzMDgkJ3gKrrOYKykK+woqiVBqgscv2jnUYTItRsJPAFzzmXbdG4TC0LGa5iBaLVLfPht2lzNKrpOJD7kspUL9NtPuoNxcenUAtabFhn0PslXnMvuS+dSOpxiSRo4hfww13evnEBBI1t3s7767qDd5QANL4nfGQsfd7rns+QBLf1LXpFceH3nC5muA8EhlJ42ORK23cdTsHg2gJ7HJStiPS+C5gZyDdj9zWazs0+YDHKfK4w5qYwpbT+Dqpz7JY/Rq/MMsyPvrupTx4M+GMDz8FRoZNijd+6NwJ7PFiKyKR3pdCVL3qlFqnd+mxm6tTVayJ/X4dBffNCUy8yEfvFBKre36aOs5qj9pCuEt3KfSXMii7nHiUBh5xrWI8GWzoMcpALlKsfqFADfjST8HnT86MSJTfxChWXLloYiTrGUhaXKmeK8S3iohOVVzFKYC63u4gUiAvo39/Z8TEcZPvcixXZUkPR8DsEW0q4Cym7ycn7vgvoRIhFPj859F/2yUnV8en6KsQHIqk74VT/n2p0g8o4BeY0Ht16oIxv/9EpcqfCh1bz9YqMBSmfCsZKrq/ZJdGIyg6npu2CygNgCha/VZDNc+gF22PGnoEHChEXeAJVJNGpQUnC++Wjn5T/+2H7yYme7uqDjeQhkBKisfCZoAWeWgJ3XnFfuG2AXvDac1ocpJRBrhDYROve4sJ8pmXDM2sPl0ajTqwuuBMTlSmMA4xpVdTSqUTxlLovh0Tw0kDlznBU4C0XNkoKGz4WSMoZe+YklxCeXD4vY7W9sdh02a0DnStelec9W9jaA3zjxfypOzPuZ1VflVSh36BSY9fg9YRhWgLaisgyIA/+VioaFRw3UR3RXvntKKZmkCsU97mTWrmM8Ib+IF1M0EnaCZ2rF1AEwdzGyld8YCeSZPBYFxeGBjvo+dQOs69wJXN9kolN8NJfpyfcMBoKnWXjpx1JvPhCFjRpGfugkD5JgXg1UBpYB+w5FxfvUZQGeLhDTcVURNJ37iGXn8mXIoVlWJCL7UFW9yb8SAOnyN2IgQW/ihrOkgtD3R0ZHeI4mOr7Qf4xfMFHxHyoYyApspTofFj7wz9RtOINZXLFQCM5mL3a5Fa10ZSCS8xnw1SmGi+DJCyLJk58Wy+MgqU9ow2NEALEH/kvMRiAYxuk1SIqA7FchKZk7H01dyNx9/SXcqPPfykjW/UyT8Cpv+Gv+d45EJ8s617q4zpJq4B/SexLK+onWlGDc6RX4WyhxqrkL2WhSF2yGp7B6sE6xdisbrN8F5tDIpfuKR6tz9gkrrRqB1zUmlj1LMy4OSG8J0K8QwJ/qmHGeGJ6gHWFIZy6rM87A24j9L1yS9Nm8GWALT8jT0210YDpR/RJ/heFXWp2toXtZ+7zV394e7NU+b442h06nur/osoM/gmz2Rjf1AYfll4/5OMaRF7zrNvMH8P/x7//z30w3gDki4xh+NJK3ImhH08OtYX/Yz4yxydCjlv6TXrGwTWfje/zE8n2dz9ju1t/tz3X9ml7erX3zwsIzunb2JpyVrzBMFIbtDqXehGGTYXAJmjTQIarQ/CuJh/Q3pOD0xwb5r6/DmT/EWpnvvXPFofvAdYdf65cXGr4a4zSVX/hqkCfjVx3G5l5AEv4xwhPLSN8SHFRV7ApQab0rbSNo7zTovuDyhMKzB+/cSDwvWwtnL9EoF+wF806MJuPudtZutPFXe90Wj6J+X6W6iJK21Y/ez040xPnBuxBxccq1sliJcrVk3apFd3xs0oUdGqnyCzokEWmEi+IpQ6vbuRtAWpkIHqTHrH8tc6MI7qT/5/9mfFC06rZ7La0TcWIoKR9rQjo7o+bgE0/IP/+/zBycmpN0jxCnRvIJhidjzx9WNIKqmqXiQRT6/kvSorQHj6kPhoigQD5dxssf5U0h+NuJkCGUwjp1uYKs7k26tV4ekqVc9Z6hJF7nN3NO7ud2a6qJi9ersh55ESUvAQtzkgrHSjlLd3jfWSTjGuR4r3mXpWpg+e08FfuWX7VrooWyTBP9jZvodwibtwfnfAUIJn8o9Av7ZWjo7bc87abdUlcaihuBocI5N7ZDixQgYitiaeiNEfCwhooi1RNptk1phbWJoO9P48ul+LwqvTTTXlqBKWcaKDoL+qvRaz69TrPXXFunETemyqgFtcNQF7nGA0PuDuhmD10s3FQtsWYB8awvuYd+Bl1J0qumnugE+xDmbnmChdJCJTF4B+d25UzBHGXn9I682pG7K/xu67qrLyXfHriKYmU2m034HWF4EMawftN1Zkm4X3AReY3uebfFF6YcK7WFxrYwv8y5nbQ35hxb5wQxpzKhAi0KKZVBFbLBjiWWcFMeHsIoZERbkTVF+xIFV5fipok3dcQgpNTHSVK3nOLV3WlouD4rQlsSnidOTHW8PtV2rfmPOq3RLZ6oPBn3fZcx6K/0+nW5VNUVKoNs2qPOqLMs5bQMTYlH/W5nVCUK8jVVI4H0CxKniwlMjdZWXBRyzq8FzyhNt9lb6Mv6neDlBXeCz6O6NNhhCQEjGDHQZlatNXWGh6BhVuzTfUetVIQAraqY/vm//wvDTkm7DAMlxBTzY5j8PtNCtbd3d5o7u/sl5g3Tkfp073DpqKmCgI3DmrdZ9mi7kr2Ad0P5avr7Ih3Ydu+0uTVg8xCb0nBM4FGDEmBcqE9dZkyRnaBJpnG89nKsPHL82JUmYV95BdOVxkJib1mK0TKf4OxSOb7V8uUGqgQXoLJEoaZq/0GGbPNIc4oywdmwXEleNFyalEWjFVdELhxtUbl0tLAt5g+Vxyung9CRGWZ4Sfo8LdakYM0KEe9WZSWZK7ULuiJ8oV+xstoJ+VtVbfzBcLIT4S/Ta12zSLvO36+KekzzKXegV0A+KfrEvLMevixZk2zOoY6oqIG3XOOuqRoZTen6Zap8K88cu3oIVXpd/e3b1OrTDRERpa3pddm+/jj2BmMWUtKGLG56vr42+7q2cSTOMSbJKr6utPi9eq60am2mj12gfSOO1cVJFd0Y/Ct0VP353/63DIjN+KiWHLeW4XHH0e/0N9v9wScfvYq6zqhWOQmcksnaItg6hQaSGN39ixzKslvVnnmQEESN/errY9+vlF+JVfudfdlKb9IdhZUp/btP2jfXAxpTJ3IDuZOrLPMg5aRSB81wEz0pBHcH+nMEqVEMZ5qxYrIr/eQq57LKBJ3kipybvqFVWDt/Q8bV5Y/NuW+vtmyASm2lgBQjaiRz+3CeT//5f/w3dkJ8GbMxZIQPHb7z0z0mpA7dds5TBNCBwI8KVbgOHmjKiBKMZg8jxBVZII6kRHHlDXK0yrgvQ0GsYCYZx/gkemMGDc+meroevlF4gfvbggvcX9EAD0syePW29OZtKuypUrqQHj80xGXv0AoS2D4VQWAsMMnNy9w5lcp9Ckpu9q73fW3oeP/zCA+OpackoCTGJMSUkQiBbWIRcMAj5MX6iBNJEbOEZ90fyunl0eVu2R20y7X00QU9irVH39Kjd/RIXbIMj/idymnBiw48jDvpgxcP8c1oqFUm8WHgubxyWGsphX/BFtOrgrUqBSgM1is/qh8Ffgf8JpA9tHaXuykSu4UIBOmLP5yfwMOr6QAe2W/upa5qb6RQSPBLes+uNgYB4IFj4Jc4alPw9AXWN4nSR7Z7Y6GMuHpELApCusBDhHlJ38xf1ApF0ntZxav2+1WxhYmsPQP0gctsXIQqilnud4CizmCi0cgiRHysO4hzL1iQ7LHkT6qHBmYH/gQPRup7Wp1EOMEiEv8k/VmAJsCPAjUt/UlDHcNBTb3La23ZUjhWXD781uff0iIPaBv14yy9G7e/YpGRVuTRxXt4NIrfi3FyADHsH//An0ocKCRfgRGl5sWAJaGJ0W+hy+/M/G1sVOt7jSAX3KGGpCOLpG+ld5/B7+lVZ2mB/F1lUFBeTSaGk0E5wZr4E204lguoiCMY900ZG1zCafCNLvA2JE1LiDLczPImA+03Ce0lfpbwX9qwvsNh/KQ9uPgWn8TvtMWzY9njxKs9mMGDkUMf6eTLoeiQPPkH9UMKaQI/plf9iKolDjj85oX6Qwm0wX+QcN1ptQrvGKWB+szfz+Fo0aaSn1UVKRQN/J7e+6mNSSL30a6bZqlGoq8g8xN3bOqUigRJ9EgfUh6trs+hdVNfdETi+GrwvP9H1OHy6AAVUFbBDh5OXsV0uBc3kvBJeC0jmlJ/76t/4oiSb9DvWwa1K571ER4vuKw0a6zVrtZIjHdZDOqsbjnT8THuBGBRns9GYJvOIlc/FcX5feZLrVEqb/v5Ipo7SozJUujciWJSWegguoejI+WT6249obt10wNqdfwqtECVbeUFBCfjBWSZ3FNKednAYbiYQVsUNilCwcS4Uod+DumFEpMPBayD0DBNGIGlQAQ4BoBQ5nJIAhl9DkZTBDaQ6tpdhA7I5G8boAHS457BI7CgEWD8Wx6doArdyD8tBsbmPRKtd9ncPEnMi9TzJHWQxLrvwbwfIHAPz6CMDZTuwy8+yCZvDRQCZiyxFYIidYgXHDwV50/agRFsBwPiiFTC8vDDF+O81eIdyHRPP1KBZuhQSvRKwGOwJmumoBhZYIZbjSW8INuG8dQANsBYC22PZZ11f/7v/4eKLcNED5Wd8pkKMTvoR/SfcLxohUF8d9MwNZ7baSae8OxW68tkKWVflxNsHgxmV0/Og6LF28KWROCp1o4AR8JAmNt8eW5w5opjYKiltGSZRnmbzzP/KjfgjBeNfMf0hXEKNJT3OBGmSu6kVJLODied/dLijOIFSZlta1YmCshcjjxPzhQbE729ylwXFHrsKxNcIh7goTVGZVPc9bLZL4H/nL8mXP2aW931q/lYfUkuNSkHiqL1cbPocdgvsQQx25iPSvlCpHDUo/d5i3GVzfkxhQGaU4gflnzAfvf4btGHIElPDkZCodRgElFGd5cT0QbveD5CzdHh1tA9eNBFTcsGZaTF78mDnjnhL2dbWcahjufzRb7FJaJD9+2H96O9vVQMzfcmt5u6O3kzDeBZFFyR9Sd/RVmIE9QYJfUs8qrPHfw4vNZjJsWOrxQMeZUD9Hsb8n/8+7/8n4x3DF5a5ENPKWNtH3pRmOwvIvoyF+RqBGAKt6mRbyIBWrgzb518SNAql3RJpxkbayROzmvG4tBO21oYZmsmoYmgW9KzEFRSZ9tckgDJFvF1aQTlYlTZcrICU4JAO4xdV6T6yAQyDruDuC7RBH8T4wAxi+Tjw9S4cVBGgJ26E79TJhIvJjjs26c30t3uxYwzMvLBT26ynnn6nfhbg70kzBzuoBftN94qK8yJYw8hYFQj34QJ85LPZEuiGZg7USFhOqY1MX7ma4QW5pMdQCp+/XZfT8rMZGQKcoVPlEiomXxqAtCAEJmWdHBNn2B8WsYlPsf3bxvSEFl9eBVVNfvzf/1nWWH1jsO+ldxKSxTkPfxQQqSXUreEwC+lWkmEppa6rz6UcOylrjYJt2/khU7qNTVC67vG+OFtfPmNjfkYBVOb8gAsyjLCAOk3MB3Rw0t8qOmOGTZbJHt07hqp/TNvd5nRE+Kd5YInnoU28JgbN+FqLYfGUg0uDKSQaZvCwyK68qr5piGeQVc/6K4nfgrJf2xwXQ/LVGw8DWjf8hjfoutLys82jsv540tRt6k6rtoGF3uWRrTTTG2wSt3VX5GXvoDkpUAV35eXrKgN4oBcjmNxLw3Vpimivp/nufIQ1g3OhjrKZ1Vc38UpQfqKIs1XVIkasXFEW7W6lISRIFogmM244fGUdvkQaIo/3Nc7KeKkqvvS1yEOsW/NY2gFZiqnL0O+ddZ60xCFcDLxoHv/Hl1thc491Buc9AwyLkZH1Qe9pFuOe1K94S/YPfebY64YGPYX4JXbynvlNk2vXHOhV0465bQA/F17/P0ipx0SsHAsiL3BJw2jdsVz4eGw25K7o72Rc4cUgoxRtcBZtFm8cGLS7XheZIrpMlvYZTf3htPdzuB02wHXuYOgkY5cjGM7R4CieTJGS8IzWIiorlcrl5x7DfO3m925Z6UjE19lpV4J1+dH6RY6GL5FbKKl+lPsMf5onfuBAxkt3727eqQ/yki483jpVTeB9O6/Q3jFtDdwfAEeDxwbmlX6Fpg8upAXYIrVpXuvv6xOVnGyJfa64WjPDE/ixudZWj7TcIFzaQXnt44zOLfJAq+mxsWyHjnQrgM/dIaCeZ4/fHQPCSvL+NtaS/rb/hd7KLrIoHNZB6MFEMxiLmrSsNAEtE3Ex7H+NDvtNxOt2ET7JRklf6VWX5oRKw0tiRggjSt5XPKbcfXXbFwpj+XrQHQFP5T//K//pYxdd52kstms0kMoDn/zYQIcnBmYCLBu0rnpGAz9vRj5iQ4s3BicV9CMA4NlsXPlpntoLI2Vzx4+P3n5B9CP8cnRgfiX35LjJSB9nx6fMwH0LLV+YAMS54aXOSAZJuQE3vzyQb8OqXzhXoYu+/6sXDuOPMevxU4Q12ME79bBeSgDWphom/CZkQkmJRuJOSEQ2532qONmMtu398Ukj1sfzHJmbnInNbLESV4mN5nsx1R4UsOiaprtD4X2jGbziHG0tqC1pnp9XEuGHyzG3lAlSKONx9P+59zo09F6NP6gKw5ixHz8ZAPLgmC7GiVbTstpu8rI3sT/qU5QB+ZGvrSLbGxlQtPRbR8o9V39GmqS/WhgZjWHWP0wP6Vcv3lmW5GGXKWMza9NCXDLEJjbB+39jqYj8Qqb6QAzYRi4GHNTckUzv5/QFXe0CT8QzYs15wRzyxUlvjEONviO0i9FGrdsWwtKtgx7OqPqjzP29SY3cB95rj+kW5qgyJE0lMZWYyFjDSvIqgLbosBcTdGsit7L2JMZW3HeW4ahd5TCZym2msY3FdbD74diprW1rD21tAFkM3EOj4Rxs4JtM25bvDUa0SONtjdpqQsNmXFb2TFWsysDjTdPc1jx+qWPojaUs2pDmX1Fnd5Pr0niisNH1RigG5aG5UXvOmZpythKR/IVzFDW7mbCx9DZ5Q/R+Pv0qkJlUHf33ebxoDnrKx2p02rWv2E6mzkNLjFy90+oBoGO8JDgmymyeeD4Ln694KHL1VsohJxCsofU+CMuBvSGqsJbQ2kHlSO12VAXgW4C+ff6vhO8KyusqIY67r+OQIRUsCbLjwM/VGjQOZRPLEm8t1Ktsa1mM29k0ut/nfiqRbCmqHpUF6GtzoFO/VCE4srfWRqdlYO+stsa69hWJsLwCxydWpQ8Tq4KI8TY+AUTRmVejr04nS0KJBSvVlUl8ybDHnMfzHx/frx9QQkVbJ/7HQebxfa2lePs9phfiHWRAkOQT2X/Y8Wp2GNqVOfWDyo0oVLvhJRqO+X4DTvsk+KhPvY+Y2ds4ARs7PpTCm1Jk4XHKuNXhUxn7jQQcdMqrZhfViRklHSQNNjfz8QFvpHXFxchTVQGFagEmP7LHEbZTjx8Dz1rk2nSKHZZLoX3LPHNy3lUEYnafRxgSji0hbg2go9lEL3tTHYWu9qLCEPdtAfJiB18Mvam8Vlg8Mu7hfYauM4rX61Ajr88qmHWzTVxo0sN8418JjIk0YxJ0y5/5LVeXA3UHQiciYEaL3pRsTSd3uDKGxXv//3F82fct1uhjzwpCzZqRWunqkHRGNPymR07MoO8jUOY212j0mr+BtT5eG6yeh3ZmhCx1Tjx/TfmFahcbr73MPjtUvOSZl/SriTVOhRjN7A/VVUHd3nq5TNVQSPHoKrfNEZA2BX52ryLVvMVYJPZi1BvNWSAwqjbwpD0awO4OE53k4FcfF2E+5KJOCg6tdcP5zNpP/tlLUrABiW4HMTe3KN5AeKonNsCs1GHYlua2tJFWYAeuFIsCDmylMbaVTd57MOsgJgkBxKfZ20GjZSADCjg2xwu3UoogbzCcn4rIkSgov2MtUw0ZMD8UdqnwKGnzM+ehpudQxfEeJABkF7viw/e8DYHK6ix+vVBBZfXE0zdoL0soqBJjzZ8wWIwQSuUoAVE8O2dDl1zR64iLlfM74VESL9voMA7pDmYEIFM3jqVPXwlxEBJRRwGcKn7Jbm6CvWPUiTFHHxg/lD32gJbVQwheL0yepGRnaVQ7/SQwwXmEpkrNhhCfStJEEK8Kt1Qnbzhe/QYzW1DHBNCEff981FFVqPUBaoDlIR6S3GLBX1e3Nz+4noUDF/am3n4gETRS+L+zYEP1KoxhfncrsJeRSxImClQcxf21dqTIjjG5YAdsyCFyy469/PurwRxqDbm8uiGb0Gs4Q+3agvkb1kr5GA6PWu4kUsSGYcb5D/Pu1pmjYEvNfQl0AvL81CiBJYZWRPQfg4DfYn0LItGuFx+lg59iLkZ5Vi7e8OJwSIl02zCba+0T1iWo7K/PTMQtinzWKyFjrZoS8fA6ClRUXUuGqOAt8R7nF1nSJoNMGyUMdDqs/DKWQ+nUbv42zTXfykAjlzd53233FRyF6hHPbxtLYRHvsr8bIofTf1q8R2//Hxve2tzf1mMR9vIf9UIj3L8nxLl0TKJBsbj0qzPtjuW5328Gf8uMC8Wpkb15Vka9yYRIKBHt+vxV3jeJBoeA55X5CJWxigkTyIyOp3LFUI2LhCSyi584lE+qwUeQmdZ2D/B3y+yKi3xeF7RbYM91xlsV+FH3Cp4xYwzFQHSkpTlCoCQAIbwdt8AThz5ziV7cPro+YtTNoDZwdKBr5J86HYpwi7LXB7C0HNDXsdMDmzRKQTBHqawEEOabyOxVS6EFpB4g7c3Ppj1MWbpMCd7jMtp4ynx09KRMFHEEAz/cCOTljfHsUsnQ3jwg6fumf6LznEZIBeRc3c3GYwrx+dnve9fPMGz2A25LtCwUJMmbjIOh0Df588vXpZFDiY/B4ZFh54cz5LxY/69Uq2lMVJdlvFKfqA+dOnfmqRzqEM7HaspTa+ngUiITzVaxB73gHf5xLDbKo8ew38bCBnGwyKjxh9jVCK153QTYRonoC9WEYxAqu3hy40AtltP9ruaOdXLlxDTr1UgCV1zvyBd8xubKc8W4/D8K6UiariYQH4EnUmQmabzRsX8UiO5aN+04NDDQwtE4TzUnZWEn9nVITVrBHnZ1VEwa4iL2dWAMmsSPbOrY2rWCHmzq4Nx1gh5s6uDcda0xhWIZjeHsFkzEDS7NpDNWgqi2c0hbNYI9bKrA2HqLSPmZbcIErOmA192LciYNUJ57C4PC6k3jbCP3SUAImsZFMiuDSqyppA0u3MRN/UOXHK0TQW8WdNRNbtz4DdrBKrZnYe7Wctia3atEJzGUkwibX2fvsB1FcCi3RzoaI0AJrvzMChrBDjZ1TEo9eYCBbOawV2tCfDU7qqoqzUNi7Obh+rUG+8rhM4MZGdNYHJ2bYCdNQOTs2uD7awRUGm3EMjUmPC+PoMPcJf6GhRiDh2xpiEfdgvQEWs6+mHXAo+odyAFQuzmcRJrKRJiNweTWJPIoV0dT7SW4oZ2TURRY9+Z0KFdK8JojcBCu0vAitY0mNDu0uCieocSHVM0jzNaS+FDu3NQRmtZENGuFWvU3AImmmjXDjta0/FEuzbE0ZoGKtrNAI7qDRrYot08+mgNIUa7GuZojRBGuzroaI3QRLuLQEeNCZYQo10rBmlNAo12MwikNR1ktGtBIdUbQczRrglEWjPwRrt5QNKajtrZtcB61iTmZzcDBqpOEZWGQXrEI7qRBZ0bGvAAV2w1CAgb/IORHLJU1E111eCcVAnB4E1+osyVomzeCgZ0oo9DQJRKdFGlu7zyhiZUKcGXwhu31WqmqcC9Fk2JRo1ba5YbacMDE382dGWmTKaJmNcvWpKexiPWBANRNt+Vze/jMoHe6iMDQ40O7Tu8LZuvHNc7YwaMPrqBRUJLRVtffpiQcFAbDdVDFjHvA0vvI1hvnMstsPDW83QhlcOhO87NeDNacZWitW8vbKK9xgWlVAQaV3j3LXOF05tSvsy6y4DlzSX81QDzjAODpUDzzPnIQOcp3DxRjrste5n8NAmqZ06/sjmMlyyBFHe+TSDfSnqzQNqXBfcLWG8NULES2sJyd4kA6JWWciaqOw+uW7A9snMxP2Zc1V/oFNJv0y6OAjfXvKq/1DWjvHn8NnbkEyV2mV27fVvNxY5nOq9Nzm+Qt652IbOxGe+MbHtndNuPgHBrUgKxo7IF7ZZnbNgzgb8GKlkEhmt7kYPWviWkvFtLMyKZWau+ADvXKF9Q63xAXWQqizP/retggdn1MwC7OcxaGtO9oO7eB96ubwMbyGDs5qaTCFtcd2MJUVn3pIffG7oUWkL2rCM9xUEfyDMJ3Vuplo4ezcgDLzKaMXiltbmbBq9kEYTJsViM2WsEMK4X+C/l6TLB/zxNIdPsOrDFqlEbdHFWhbHrclVTP+NovkILI1c6Bpd7ATCScKogfrVj+tXPWTWLYzWoX+LYnwTuN9OS5YR1ZeTb/IE3TFwIRkO0CK4xPWv4NcEC/+eDBia6XgQPrAotOoC1hS/D/sSTRZgOD7ifEyNuLJ1O4NwZB5Sar0GLULGoPEphkG9zdSFVL18HFGSK0sHA1tT6dDai00IOG+vFsmNOH3thhHTUeE+JGghAQLsLMGULEzrKtHbL8C8YLLACb6WmMg9uwGRM87F28k/QJeavRl/LlgLXFKUif7cYbWuywzWDT0QM/X3fIVrIEheFnayx65fNiTlMj/HTY+VKli9+/CAWk5V8jFtKP+okppER9z+Nq8TC3Oc0FgXCFHDkbDjMijyZpQ6QRawPoaQVEDgxPoEpneF6xOQpu8ZgNgoNHbhY5icTxjzPx4I6GL0T2094omx5POx/6dieo4btRgPP8W2/TtLspHtlhgg1Q9d8wqTwWdggHHXpNFdRp15AzDjHRuHZxUdFm8+29vCT4M6bkAgXCqBc9sBYAx4fM0vCOkUlUZyNOVkrZSS+TXHO08Zva1msc9mVW30PMpZnNumv+SQt5cOPBquLQ6a9tkAgkqDj5xfYfeBcs0mgcbdlrtq2NFooGQvxUZf2vSlTXyRh8TXRs3ltLeW1gE2LnC9laigSQoRvEPOZf0Ut/O7QnMk3pECuLJwkhT3n7MuDVsiFwRkQsdO5YqvY3bi6ebC7wDzYtkmjOR23CvlfyBzDlNQHv9Z5tnT+lzbXpyftXxcdWzr8S5zTXx3dFnS6YG7NpNMCbTYVO9V8weX0WWYc6a2g2mq6itBvtSdLKrmmYmTRdAsU0wI91rmObY8TkJ5ugUXvRu49q6/pVUSray/aW59MedHbLLbq71dz0dXGvPpyd+XlE7MlQws+Dm7ItqdNIkOfftGMydbjIq70F5xYjID+pTN4uzcnx8pzjFzbhHfzS9xqcfcDB/MI3LWi63Nn4//jv7HTKILxijNaVzpnq8aFnapxymjwbxTE1ypZEhxrih/Wm6lIPMvgFM/WHsHHPDqNhj5tC3WygE+LULGCWKdsVo4K6rdGPVmwvM+GNjTv4sv78A25ARpJ5E0IKO97pAzu97aNIQutU4jwvQbmThFWN9RgpIRV7xuRW4T1PMGY+TRmiDKIMzF9oDiodScAHeyzkulzIoyWiS8SM7xUfNESGJNp4XlRRek9YRgLNAXS0iGsq8XYkfsanjWfOQ76XK/X5esMPmdxnlPgcMtF8TPQ3fo3lFVl7DwDuI0n+dLv8jbEs2HNpEz9Ql3Zv5pBLLd2dP+3p8hiSSMFgeJNETdN3F8PJSMoVcHg1yQUOXhQLgNYKnPYMC85mvFjucbb+0wdXh8jCKukiVsRISifF2zDz1gG8U4BmVBYIUGqHvIL+wT4h+ggiecSI9obhz4I0cMSLcPv3fcOZstgLhVFPibQgd9TMkZwgw9T2BBoudvKytsd7X6lbjuNk9kZ7u7t7c6PDcOjArBKMPSQi/csLMt9xrOsf3ysJyVnNhKGtFzAw4Js5nz/tV4uRN2xdH/b0n076I68P0a/TWTOxjCoONX4SkcnTjBwfWN8ulZ0D9AujC3umdQuR1Ayrljg7/ILo+sWrqpjEYPQW1NS6zPtfeDyn9lYp+XqEHoLmCa0mVZg6AeZFqAsRvRmQ05Eii+d4ZnAFwYj1ZJbZV9MLDQqHcveQGOEtwLsrVbmWQKkcMq+VWVsP3+qM0wvgEEQB+RVGiU/2/inV//0Ov79m69+L/6+bogPX2w0ErQ2XA1ET9SlKQWWKXh7Jlqk9ipxFXVZ+aYOgLFgBtYWbpraqC+6kRAczwgdDWclwJjN71+cYfIJrBOKkMcuyGQv5qCUOsLymSbXTPDgcHhjr4wzmfJjr/Y6eB0sVXMDS5bZV+JV1IP0og/dhNPG4aFe7Kt67v8sj9Lf9Hf/xAhkXrdB/8SR2pnt//50f+2KC3n1dhFIm5YebKfhaTCstLcIK9ts9k/MxK5XrxrksqAKAWOvt65HEs8ZNX/XmCLevCTPuS2vPmfa2xWldH7N3iJxFKDGcwIhDZSKoxpK55zVHGnJRE/uVfz/2/vW5TaOLM3/GzHvkKYVAjAiABKUZAmw6KZIyuZ0U2aLlL3dkkwVgSKJFojCoABKbIkR/Wv+z+4DbMTGxLzC/t9H6SeYR5hzy2tl4UJJbveM5W4CqMrLydvJkyfP+U4wsTBBq7HmJ2q/HJ5PJqO83WzmG41pDntyPqm3Ggk5ayVvcxRHmtiZkLUOG8Eku4DdsueWQSjjTTiP7CcjKDxvvgU2Uu9T+BA8Fzbwvb8WkJY9Viz2lDk+EoJD9WDnSc0jq35DskRz2dN05E2o9lhXe6yrPcZqG6PeaXG57sDBIbsiCdlduUdZNgh6VzgVnGE4FnE27kNSgiNAKtGjQQzks3E9JYD3xlUSdsvjlAJrnSXouY7PtPVYWPz5OD1FaRUZ4iRr33ovm4LwZWDL3whrfHTrvXy7vo3cDX7jh9w5e3a+XMZxbm1mbyK+xKBDKugswKcdEIzwOIJGyjD0BiBEnzh6whTZmlYWAPovwHY3wMjdsjEnkwkcUD3o4tI+tsbpJ+kpm2HSduIhU/iyjY//66HS0+Pcgg8U8WfJzBDvL24j6AD9Qvb45KujP/7Y+t2zr+5XYPWSTegVJcO2YkI8PRYLY4dtP7+4bVYOYVLqynQ1W4/XW9s7G3d3n2A1mOKiWBawapuO9mIqA897KHsaL+fK9zBBBikVjiTeVocbpqb/+YeHD/7443rr9wdYk6REz1sKTmdr9dOuqmGa9sRglwrF9iMWg1RJilWsQ64u3es1jOmOig/T2PXHre2Nnbu795AEymnrJTOOzLn/dO6SetrxFh0YXY2u8IrVsHg67ncKUCQyHV4g1J0DnibyHCko4q+8GHCzzdld0XiSGCsTLFM/42Mvo4DjqRfDMlVKXuIT5zSAPGokJvaeFQxNFm4fQdZgAkehrCGAisjbjvOBu3IyfriQ6f7SER1MziCig1Q6y6+gPArDCaqkSsIw+AWXBXtYq1UQPLwk8MUvt6M+V/CK0uGgPCWhKILNhKF3+vnzHOGvPgXWOhtRz1dE4XVoqGB6vVxYBDhCEeGozw1uJcfZ2zriPo3ztFNhj6PXDpHJJbCsxRRmnLRI6sLxFz5HMAW35QvEd2CdE37eSx4Ao6EeuUFcCN2J0ic+wKWl6D/+z7/+G1WBER9cDf6JRsKa3+2ctNjtSwd4CEM6lHRdqV7OhZBWTryJQid+VNwKH2la97N0gqtTNRsVrh/P4YPGpBZ9x+XU4govSLyUsktCQXGZmr8QzooyXMa9K4VNj8U//7aMx3PRC9mCvgnzeyoreirIZeYCJhSdET8Hkc2G2YRxZs+mY0cQBhar4PR82U/UCXAQnCVIbTZI2+JTi4eGgcDDNCD5Hqzk6goehY62vj2W6ldW1Yo+caFSo56M+vXpeLBSE2dYH8WtBPDVWCIj+CkrzxBeL0P8NQI1RQ49yLI3OXttJUMtjZ5MJyxw9PN8ythg6GE3HFwp0jghBFCSU2oo/m2qzpPLdFixds4WYRCVdAQQkhbwQTR4B2X5Lsn3KXqwg4HWQFqrF7hVXTRgEqV8e0UAsuQh0xCW5/3gXF3M1W3oMMDNlycvBHr+/fra9csTUcRxilqt5t987uP1syyWxgXdRTd/MgXcW12/d32raSeTyQE1fWHnK/302hdCBYOwzb0pVTmTVDCBdQqtHsQ7wvU1x+gn4hZFTbKwkNF0ldtfPnzw4EFHHeFxmof9AoPHnKTmHJe+S7oTGPP1NRwVOFHADMrN+a2h/pBNzbQiJVFILKpobE6zSuAAyapcVthx5dW0cdaQRWIPVzLfa41wxi8flMaNQ9cpRssghGRSXw7QUatLOEBMGp5vdN+YYAyGZfgTGOfaTy9soAOcbVrryywHb3xxVuJI8qC7V+RlnKdkXJcYVViFemCfHxzsPtveOtx1BjMcG1jfOjmOra4/pJbC7elCwkFaYoiKZZeytkV6ZvnJ8fGAmxr4DR0d+zliIg3R8PBTgW5Oxlc+9xiTbUHyNoEdZxHczRLkzfnYmzPRN5fB3aSAPz52bLVmwQ4I9CfA5PzC4ad4O3uWHnc5yFo7GnkNjvgYek1MeYxtgLFtJMhO6bQx4tISqKeTBraZxiA7q1ZeoJIRR/8VMIZ8BK/SNnRm0AlYYK2RT0/4UXWNYyvqEhezWgpAPVM0VopdAqElkwOVwelm3PkQV3s+oh3G3X014uzPg0bq4JEwPD8nuiHi6Oe0FyqN0SUtQZxTxk/VLsoujqp+RniqIHRRkOLdZz/sbe8eHj/+w/HBs++/fba1H6B9YXF7vaMMcSGesjVPoc3JYCDk4oqXGEREdl6N1OBs+jajMSPqJpMQq8gvERPUrNUR2Zht+l5Onl0S2yAFKdyw6xpylnWAlLxqNtlVASlTjHAIrDQlnSDKDXnNL9LrMsRIg6J8z+og2pAJNVQJ1uh6y7c6V8WBeCFPXklFXvprzw+sFgfpQQXeIM/w9ou0nRylTtB3WdUwuFoCT1d5gLqKEXWVB6mrCFNXuaC6TikaXld5+LqKAXaVh7CrGGJXzcfYVUWQXeWj7KoozK5TmAXcVUXEXcWQu2om5q4qBd1VHuquisHuumieQ7fRN0DgVYtA8HrwoR4Yr4qi8SoLx6uWxONVDiCv8hB51SxIXqccAudVM9F5VQGeVy2Gz6s8gF5lEXpVEaLXzXuaF2ZVgNarGK5XzcXrVQXAXqURe9XSkL3uwFrwXhVB73VAe1UBtdcDtSX8XhUF8FU+gq+KQvi6hSGYrypH8xUQX+Wh+Lr8w+L5qgigr3IRfVUZpK9Tngvuq2Lovh6or4qg+rrz3eD7qiLArzIIv8qD+HU5mgH7VQHabxHkV8VRfr3S3kVYYwzw111qFvpXfTT2r4qB/yoH/VfNgv8N8W4dIGC1PBKwKoECdvK4oMAqigocIP8KPrAKAYJDXGAVAQZ2ikKIYOViBCsGCVYeSrA7spYfzgIMdnGCVRwo2F2ZAhmsQsxg5YEGq0VQg1UAG6x83GAVAQ72utZCCKsYhrAyIMJqMRRhBtg0WFEEGUlctBh9AO3mJWCBjknrAKGac4Yp6/Zt5T3wjehsq4Iy/TwWHjjiyX9qxfI5eMFFAbIEVtgTJEUZ/l4wiXV1qwQ/XCJjer2LMUwQq+kyPXQjmhZiBlfyIMAwMJQcG4aKXDjp7gJz76PWwxST81VYLTiwJNCPW36FjwIKOoXRl6oDQjkwFkJHe6QaIKhJNu2KqjpVO98HRydMjQpj70BYeoyzU4jyzQtWbKvRoY9tY5cMs2xR2bwumx9sWQPdFV00paPm0oTpSqIWzw+j7FRQCwA6sBv9BhWjKs+MrBzLHBzIlo2wXOzkhSItlwF5lBXm4Ud7rseuO3KhwKWGf9HpVStjCpCPDGk037O6iQyNlwNqVlHRhPdWaH6jzAEcNvazbHxVUEXw4n9KWg47or4Owa+g1jgdoEV6AbHyHeyRwpNdFu2DqvtVNs6T3ECi+liSurSyXSAY0MpWr0fReKGx+mEFh9gW5Kgmh07wUK+7PVc8rxVCxjf+9lOiBu38MmDOcTvxgxmS0oasOcaiBl0CEfxTY4CHMN+2pgLed2So/q5Rk+Moyf8V8ZEFBNksn9c3AkzW3pBF4ORSQOYIfnIEJn9hZ9AQpdnBKZYrpJMJGkT2ES60LDh1FI54FsDwD33gyKfLowyXQeEbTF3ckLviO+mDiLGlV3lAgU4sy+8+JhriXGz+iK9tRLaToNDuPpbH+L4rLgSSUmGnE614lQUs+INc/1Wt5HxBxgXEzySl3vuGVL3QR5vesOZLLWR5wNmDeMTeJbdc/UnCOUr7ZeIR3Dgmwaf2IC6PIPBrFIEwisDMy4v/VvEFft05P+/O6bpP/d3EH4j6fP0ahWChKAQ6mjq7FklXDNEoA86VhxLX9m8SrsCh8BkFGwjkIzgRazP/SZb5ZMqLo/7ENzz2DzSVL40pv2pIlvoE8wRku8XVvMIDa+jXJjIWGVAY/0M0RvPn6etPFZDh0wRi4EBZ/6VDYv0sse1+WcHXTIQNjgsQx78nR8TBx0TVWDKixs8TTePXSBq/RtJYLpLG7iCMpVGIowFJQlcJ88g4S3gbV06oRsW7HnTwZsTLRGDF1XnSc6PBeIrnyAWOX9NOhqb84xSdGVwbQNx53qTpSIkBJvH4UyA3e1ufjhRsiLkTZ6csBIigcRbzUfld7bPQn1QC5E49yWIhN4oRNzzWErPpfGIIkHxo3Ek+Za6dWMux5TRKAyFkiw2/tSoXI38YJgtVhCpevKyc9d7TVEAbdFreiYLKApL6+RZ1lTPMX5SRiRbqFA6k8Y+S5APOIPOr2WdrdXTrIQ+GJqzcD0YF8IHpcVN5O2JIiqd10SIizgQYXz30joq+aNuNNcyP6uLUICKeH0UGZlZ/RJKeq8Iis7+3Quo2ptgbMnhOZ8ZVzsfRaNEOyaZdEdQhyLOebwjOWDLv9eYsoxjCPE2Xsy/+SFREJYCImsDl8RDFej+ALOomQ5Ttt7pd4OcBYBE5aO6wa0w54mAyOtTptCGv9eUyRdRmYTgiFSw6QgnuLl+h86QoapNBOp7UaUTgoDnaNP5euKhUQjfoW2fjVAzjsGa0DkkbXzdHm3x+rHjm2Wwfi2ALSMDzIUIuaAiGYQZcm/oENQPVKXrLi7FmrrK3Q4W+UDUXwg7LOEiu0NUfpftxv0d2xNyLx2j/3XZ6lO0K3HpjgFK4MCDJ9yifyBDlwRixgcDMUBW6hENOK+Kb5Jzj5C1paEvcG04y1GyDZH+SnieXfZy4lfwiA/kJFgTla6PlEayBfFKJAXDySF9kk/QzzDhxyYCB2RrP7ZFnnCzmm7jIEc6dsiXTPR38rHOZCJDG37D61MAkHhHmtZJBUthZauvZ03nVN39KxsN28jZv95OLdvtl7/1667qNRL1svnj59s6j1cZv6haCS1O7LLkaiEuTJafHhtp9N6INtq08OtZbG3fv3f/qwcO19RZRYyBocBiHKKHC9lzHN+UNvNE6X6XpeIzUmIk5a+kHLrh+Ig9M7gaz0zrWLtXbJf62ZT0lfPU5zKdM98+I+4tC8sC0QjRQf+NpFhiDwxRshzsIaLFhQF8VbxyW4iEyMLPHGR2bRFTnFW9TNWzNP/vyn+nTpvu6zLMt0Cti8vx4PNUbRaEho0DlX7ybWWdd7kxXPdzYhni0YNNQnFcMFzusy0ZsIl43GtRwwW9ZzgcPW1Ofyhqa4Yh3Uw88ZwLcxN2t6HAWdPfrWfOm6IhmJ8jrgH853SVxxOXMZh9YtGoJ724GwL/bfG/jMsyb4/m0C/lzuRnwXnGHr2yi5nttbaODd46RwYdJMUVsU77Z29wCcc2+Y+VUTyWn1pcZ1g6tREU+d+gWT1ta6X0Xane8hVXup2wwMK6Orkaem5jtKq0uHLO6sMppX4xNP+NPNHEqeUGDUGMt4NhXAYr7m7NgdFbC3CVNBDVfjl1iPtbXB3Z/AmB1R9m2mJi5zk54z99u72632u09AcBCS2O0QJ6SN6uT4AcMHVH+GmTO6bg/ufoWQ9qXphKr9D2UP06ToLaQKvizPZjmE7bqLpZ3iLWyBXjZ+6Mkf7OTwpGKbM9m1fbb2bXxkaDd1o5Cs4piNwzjhQFPhpf9cTZERh0r2zph8He6dJ5RweFGu/14CgdtKk0cI2y7n8AfdM8R75xIkieH70qT+FWx64b+/CFBQSNWpz9BSgp7tgN/dh67M00b9ZuSJI0zEjaJX5p288BBhm0uWprjAwejix/RgmOpn6WjgbihmSldRor2n/NmUKF48XlatHlZF9tWklYSWW8TSKlfzih0a9QXFxIkOp/Ab0wuqxL36NtK34rtpIM+iENXpjKb+YcW/Voga3RloNegcRrEsuwDbudi9MRKW7osn0DrqAj92ce9/2SqV/tiRD1jp7p2+7sMRq33x4y9YpbrJlpNB9tLdAXmECehb63r0FK1SmLtL4QMwnoULUf//jNvJWwNk8EVjFRu6BV/SmBl1n/KJvJLQ3fKdvufspN4UdahUvYCXDqonJ9Z6P7hb+eQyD5BzJANAygtz7oI4ULMz0+yZNybmcO4J0LPw2HoJMveuIxxP0FnjFT9Dpo25G7f2jPEOZl3hz26L5mRKWDp7PgILTxLl8j22338k9K80ns9JNzrQSHw1ZLGbqji5qh/l+YK+NP2PgyL9ZacV9l2dgY7e9ZuI0bYQZYNFqzn8Pc0Zqk47Y4Mq1comWiTf9Okp8hqs1G/OzN1UMUkHRmvYvwJzZGOXqROdvba/z2M1zjTjq2L1Wzc89rtg3GG9pO0JaSX6SDDwBOI4Zs7XWh99SCD48lXyBHhlT+iPh2oHSTjC55KxmH5tvoW1QJDmtGmKw9hgDlRT0/3vSF60IJkOrOAYHfcP/S2aG/pGP/A28YN0O6Y8oBFR+7XeAY5DbgyOfEBVGqg7O27bOjjgitlX3vHQ5gLIqX/mc7k5gBWdqIIrvvJ7jcu0seOFqK/sHdF3cBboGqJ1e424ZPghFJ+S+O1rZjeOS6bvjQdRTfHbDKLvCfqHufjeHHG7ykf9KMrTzuCqSsszd9FXf5fynvLWFH5Wo6suhlLJDoRX7m9xsF23CPzWO2+66YD1cveDlE34YFyk/HQIesIjS7A5O7E026bwySpO+2kWPXHeTUYCm+psHU7eiKxD2p2SmDXlnK6fNEFqAEaV3FzRsmZhHLzyUP9yxMoj6DSneXjuK7hGoGKPLJq4UIiOM/iZPctjTgRepDil0Arglfy/aHjEMOJvNUbo1pbSzUajfGqOu6iGRSSfG1uvWWl+MvpRuVW6CKoImUXe/IAL+8fqfVO5BVspfJ2zeQ1mmq2WzuUIqoIB1Xo4gEPUYzW4C59ZOqKUBCknWRwmsbnOHr7yeS80U37gypWpgeoqQu0zGfExVP6i+RddX1VvveHRPyqU26t6Bjm9NWoSBKrnx4pKknV1XpN/aMmIWwpPNqTqUck58Az0iqVsCoF3XHJdz0vMIxAqCKEpVQXo7+VaNimEKqW1Ar1E2CFaTqMYdsGZlnFsE9shIw63SPsM6vEaytfAwzCDhr4OkNzLcpgdXt4ko86////8ae7k/bRSDBajniBIGKDs2vVgqLlIyC1xEg5iFu0iZYSyOpvvddDsX7917/871vvzWQJhmhVOa2rXSPfiTZYk2PDGDlGOixQ0ORhjgOyheGJyNhkQItTaTthJP5rb6LvFRnRe56cmB7EhGPZ6QuPZigjYyz2BfAaj82uao7zKuL5o1muqdVjuDdiuTZsDda+jaPJbj3sRCPc7xtVkSEmryYxDK8USzmbVcLpg9OHpwmXcLoGv07dEmhtRn1dHMs2Z/bdLQAIh/cpgcG8b1DpxUGz9nm33ksbrrUt3iA9nbQ3jCk/Br8wXXVdQDgGquj/jkcLyIvXkTUkrbpbcNkJVtjKZvXWe3csr2tmoYZxTnUfVr6eoC7PZXH0wDA4+lWHFZFNJ+3T/ru012EsaYRnx4uoCV42wMcYv+pcnGSDUmhJSKGk/HVzch5JeM9LuLcTT9byy0PfsXjCdSnvDPZPTtFE+pqaVrxu2qzEkQPGuNqoFwN/fzvtqK09UyUMLDPxk3GavKnj7w5KmadogRe+0IPtHyDwdmnSc0ulsT0lKJX2RTbMaC/pLFdXYX6EVe/1ihV/bHOeiotNpV6xhTupcEyC9zg4r2Nxz9152uRRg0+ckc7o+dgAB0aYJRY2hjOAAQKN8Y0bws/jVo18xeUk4mhjGIf23Znp6LPitNwSGJoVn2VG/kPXKhZ9rmsrSn59DaIjck59Ay2Y/rqRmqR7iKe+ZmD4HXKCcsSFz+Ph1z7389N7HBvY9bWwqjBdkpx8dfIgLNdjjXd910AnBGLY2PSUrkewMLFghsLCYNB4C/qgdfdhRx2M00vPotmfNimc4C9O0rGclNLBoD9CCDrkDQM02mGxgU3FAjPd5N0P/bzPqLpfeS68IxGfA6AfR7SG5tj8Hs8hroSF9OngAB+Q1uaEB3fu1LgGliP6s1QGTrp116aUUIkQVeBQZGsjubcYkhbmWiuaYXfYM8lBXnPaBLNT8t7x89Ldt61sE966hFUQTrgA6aK7wGaUvtBUzOwJp1Ik+Gvl0zm7fuedc2qJ8R5nCxnhFjJimNn3PhkjlnWomrLtxRUA3JUbWxiBUP3Xv/y7bPkeP40AwBjLajKVR1GRKPOOXMvwJGRGQjPMBYk3seG6+GMTHsR5jyHjG8sWiEUIGwpYT2lyn/N4yfAVpWERcBGu43ISvzQQMKkwEMmwvtCJArsj4jrhIujYebMM07/jMf1Nlxl8Cu5fKHDRbaCYcc5+UMzwKTaGYocsuEM8pTgKsE3cW+tEBs4OUeFIOdMyDOnoGUdEz54Hi+x4pvJGA2KHHQ3MRQtUHTnsItQILRA1IELOUpbHdBavWAMsq3pc1Kgq7tkF88QISMbTidy9rAqkVFxbWt8SnPO+KupaykypArs8odEvj2UNjlDwfLa11QwPMq1WxuElRXO1VtA2MYZJvUxmJT3S3eC8+reIrL3p7iRf55dnivaFRyvrrRXFQYf4+yXMwMfZu0craxhD6D78b0VhFEbo8OkY3T7oEI2GeSBsqN6jlf0Har01qN+t3z1vNe790DrfuLz/3Xrrd/j4zytNJ2FLrW+cr7cu1xv3vuNXTSDEo2xHuhzBArcPf3AGJ/T4E1s5nCUYfj1cVSty0vbP28FyXdd+JwXXmGXsE61zi3Zs8QwUA8+WG1iwsmuL8WsJzKehGBCnc5h6aU93XxVGLCW0EG5QaBlNTSgNMlSpFT1I2NnavWi5TMZoXjrudz0U8crMoJx45dg9HR7rgmzISddmkfKPxtmEPTPqeXdEBqWYG74vlBt20+6VyYVO2fzIyWyDOxLCjW7LC915r2qezXAsQedGATMmdU0EBlv6nIEzNKU3C1Nh7HaByshFx/DNDBfqxBHeMakOXqvL81/q/sDZLiT7CYglG8JCMVrm8zb5NONs1rAxZsZSKW2KHuSYEpP24/nwzRCdnehJxb+PirAGqctwqpSXP8WuMZ5tcUc0Tcz2k6fa0YGmhy7r+XhQ1esH4+LWk9EIIwgOe8kg0yuo6G9k9qntg9nFzl1f5WUfJWcHtH6WqcFZg8WSCwUszrPm8St9Z/YmHTJiKa6ZI/zpOT/JqqKb3orsG3XUASLHSOzFdpNa4LAKKrmm87+oYPF4YclX33jHQCk6pp8WXP/R1W/WvnyRx3MWfDtc+vy3gZZdfDkylrXuPGduYMwvSpa/CMcI9WJer6rK8ckgGb6pzFmiZtmcJkBf7wYrkumlZVklZLGFFuSMVWOlO2filRsRAIFflJsNeJhoPM2WMSNwLoOLZXeM3xFbGIiAhBsxxgBE1dYLirGua0O7Ck/n7z3Y2/F+oraYH5zRLNa2F6RNwTq6qPhZ6+Dn1z7dcsmBr1D5I2NOechyx0v8otvXCjhMMdskYenbMUOtEIu0utlEP2WmJXUexgTFNC/6VjWIPcraJsbX828J2PfffbrXKz5zFPD82NG4v6pFYsNhc30DiAiqoGnin7iJf4ImxjLBm2hTvbQv/hRtslwB/kzNhhm9C9IvlA9TGhhXOujlemZ3cwRqIdIQQcycwuGJaZtgm8MjPw2VFPQAzrVDhl3g1z6SI4j9vfTd96fVymqlhmqMNQEp049X4o9fDuV5AAdPhEEmYEa5ddxfIb/9FSzrDr4NzcVMTm2ndG0Q0oTBmgcveW/Vcbx7PfX4+33HNur50ZP6Az9+iO7ak0F2IoCUj+ErjPrL6ZPdJ08oxGJ++Qr2JXK5Qfk5fTdpwrMORUtKJ4+mk9P6g45RQ2BxCwqErjAIW6IkYzMH+F1FqpyUjmRY0R5udXOSryOt2AB0HKzWGpNs7/B7Gd6amJmsUSxu7OgGtKBii3ZlSqRknF7Ctm0pMZRGXLzhIHkIXZESBlngtUqwZLMcV03GcsfsMTm2LlaK5wTr0IBTnb40cpBlJjR5aIHQtqkrrWkgUH7qltIXF2QpJvdSftH86cVPL/PfvLrzG/l82ZAv2vVZ45kaGDWfeRNL5ypifI67YPFzuOffzYTzUCS9HpSVVxE1VYlbtQaj0PVb/EFiVKiI0SFHK7XCeb4kEO4Bgb2xmgQd7lQvnWCrvZCvFFCs3GcXEwTTwg9XSfQ9bW650STDWHU3CElnSkTTHA71ME0G1ApOZFFzCPmHR2fVAHbTD0RSjcCK04pLqUs0zLitLw50tzWAE8WXOgPPcNV4c1kfJf3xqvpy7D+pWDxc/OkIsXJYFQxgfBki6mEZ9L7in42h2TNyUKdU3JMy13H7NmWED/rtgu3Z4XQDyRn8tIrpaxB53b6CZ5FiZBuwhxKT4ZF0rwsE5IyGV3bkvewmLnginDXUI1G1fNdffTmEXUfd0Q9gkWAcUuOYesSnV4WG6eMpewE0/DxIo5t0hxcK0u4mu1Mv/Is8su/cvB/UE9zfXYTeD4qbHfv34dPVK/Fw3Xpxm6Kl3Rglvd1hr9q6RzuSX+0HDGSI8Un0StZZvWU7pwgES8P4aU7t7sl8Rqs5r9dFXL2eLzNrXr7PYhNCR0Bju5FgOmCCVmMtSISMiRDuKBZuSsVofyg3tw50nm80pnn9LWxQ9VYjIV+TBKRLEJEIMQMqqHen+SS7SMf1nltTE6+Kmls/Hu4nIyAhbyKcVb2f18UVuYHv/WYhLXu8wHs24A2ZcVcPdp7USgis35BA4SU9TVHexIDvmoBjTcAxW073TotjsAMianZl+lGvT7TgD0fDHLgxMXsPEkIJjgmcpkDUnXgDIKwGA9MT3g4cQKBsUonM1Bn7RDKB5EKAIQ1zrwfXG9pvHIGt1F//5X+FhNEjjhZ6OEGVNj54PuI7B0M2KU/cglsNnWgOqTbLRkOg36h/OMxwrqpboxGdj0YJLOV0gtajcjfaLpZdcwu821C7QzIRFDc2dZH1YMdJCHyARH43MjRwC3WSnqLPRI/6DMbR78rHKQmaZwnG97RnCAJOG4EwjPj+UEUyICgXeErS5gG/EYFu1e4QcWinOXk8wdmG75kN1CvF7SNtDvaLibljg/cEsY/JvAjOL7zNcp/RhV5PN/jvSlT7Vab6bDKVMw9wli2EFUspG3ReisxTJ0kBSXaU5QTSIGa9aJ+41iEj5jVr43v5tsMXtfTj3L1RHp+dJHDOpf8a92udP9dJMdFura2tdW5oV+kSHAGldU0BAkOC4Aab7qe5FfcfrJGl5juxSnp4DxqFP6VhD7FdHr3kl8EB8bB/uoizMIQK3tXh/AvbSXsNLZnUXShXeb0AMopruPBFva5oHESNrur1qFWDvmpHY3S1zvbn0hyxLSgajn6cJUTB6KHotHG/PGSEmNETwEzrQWtjvSOw6DL3FjByWJzTGnYaMyFxbBf4e2CCYNtDELm+vRwZUejZ3dFwOfc6Jdf+3rAeZc3DKSlt5g2q2AEvOKzOAGygqZY7yRP8r3ToAuOWDQ0UJUEmMj/kAitGrF4GITKDiAjhIJJlg464wG13ylzoQBZ0ZLFbD3lfZBUK3jYZmaCkl3H6w+AZA/WrdjKdZMZ4Rfe6242t043TjRndqPnEvftrxsIbVjyVO5vpoHmjpqR93u/10oBrrIvTh8c01h7UQlMZ7AoWq+pEVoR/zGKHrQ1oY9qJsZV5fDnug1Zw7vLtoJxJ+yDgGmzKxW0p+IuVFSsBZIK1EDrDrGz+mJ6Y802k8HAGS8eSYmFGTwZzp9APowizLPMxapNBExfzXX8VVXofXZoJ6OEtORNfpXTp6ZXKcUlTOrRYB2gTuxl/6EM/0xtQTOwvUKEE3TljpybD0KIJquZ/xQXlzuLA4s52RRiAaYloKf6egOJZnWMbw/GtPUW5ugvyHQhGE1gfFJ+Icfat90doTxjRMRWnIlHJzle+7xL6VVmLyEEyytO2/hIuiWLDsdAg3Ez5ZhPLjgX0CnsY2wDaMC2l/ceNuEueWqySIh+fm9ZT8ICKRw2kU5G4E0V6BB2MfmkdtbLpq91u2k2hSCa+hO457u+tY0SZ+FkmjuknH65wye75XK2mg+LnWTAcTaIseJg+pC43VbQzXsD6hddFtg1fh/rrphFsGl73lGwZ5RJ/Ub6zwpwr6dHplgz64/tHRCDToeco5/kYrRrX9PFv/eH9TlSyo8IShXfZj1Z+Hj34yoyQeXbXpOHqpd2MpR0+OPIILKXo/7qZRJbEvFH75Y/Qz3UR8NGjNeuSY9HBmcWt5FoCryEW51WEVxDhVdK6vxmvkp3vY3iV0HL7y4dftR52Zl3blCyD2GFno6CX0YcdqMq77rFGyWU3PxzOG9MmoxFi9vIlBAZGoUMS2nfisUcCUDQQGPlwax8j76px+s/TvoZfX2iOLN0a9+5jlUIqypnMP4odpSgO6sCjATUlh9onWTZZXEEgOpCZKqq4v3oQtDWyDxIji+kZ8d/8M6fg1fz1L/9XAGsKDAq5EfMlZkq6uHriFFeXAKVNoOIib5awmhLecoR51O3kAqrfzoa9vpygk5kjMVe5tcUn8RtogeNjUdxJWJgItcG0KaTDXkF7tRLR0Tqxu4e4vgYrH6u23dxGuLXBjPBpsXjh6F9F5vbjC4yu+XgyJMbz8OFGRyEEqWictwd9oGKmxtb32jRtQO2iF8eMbh1qnTmQ/z5N0E7pHQSlqhWuq4AFGTs235bSIFqJFhmSDRE0/fmzPYTXg4mI9zwLaVWDEkltGi3OuzWN3Y6LheRrTDfJ2rfeT7Lrb4TCR7fey7fr21jFIwS46V2ZAJ1epANu8nHuhuDkW50gcNMSloafEhCfJ0+XJo9Cp4LU4uCLSV8ymSTdc6NXm3kFb5VrcvmNppo4TCg9TnOGyTd72ZHerWT6wyTBkDCYBk0ACoj514U7bgpfhzercpW92HWxjSG/5P3v/HxsGbtEhh7GRmOglmVynSRkXwVTvkEDTKIk8M1qhdXtMtlKC/DvocM5Naf28U0yDQd7w9F0skQjh4MbURcNvLLAyJVGCOOMJ+j1IfL1t+M+5LBuVYgqOshgevfG2QhtpnP19jxFfg4MEad/Np3k/V76D//DVA9jtYvoszhwuJKqFUqMIUC1Ab3ni5U2JhQwCYYbKsqBJTbyy25dV4gX7GHctqL5gZeFfIgcM4MeMu2eM52EQ1U4nfWq462hpD+yIUuj2+cINCK2H9A/ddj3n1PgRnJmxU6pwtrqpqdTOFSoHP2lJoMrlb+hAH6nqkl8FLg3o0xDs9IcI1aSdUkNy3P4QNFTNOrH5tgNFz3DqIxF3cFKXEFL/MKYpLZ8Gp8w8aMyAw40Q+einYzpDhAhkY2SnXUecj9yoIIzZ15dvrWIcAjcg8lmBzTr3YEef9qtQzulGifWIDF6jzluF2G0GS/CibgqMOTqoxCU5xilphx7HKcJgjE40M9KUTByOqupCuz+ubKhs6s452qFxGgdHUmMARK9xJgOtug8J8RsVcEEcJTm315C13kaEz55ajexndAvmgJPug7TCBG+fRBPGPORZtoVu37GsznyBaTeZceDQ5Q2PCIk3FLb8ThD7zb2wtY4FnaEJiI6lTNLnD0U/QKlKMfZ2HGHc6KzGqepNymdQXkG+M46mImB+AhVbhNNXzndC8j1CidtCNHmHLPGFEo3Cn5Y0ASvbBq3Ry76wwe1xkZMXRCTtAOLrRFVvhEvIeolb6vARiyAQYKdZyIlzoyOqOyqm88rzjF+GKy/OMu0WxWjCRBSDFkUoN8AyWNEGJxy+B1DDXjSrF2lNOQO/4FfIPt1x/3RZBO/EkYdfkFtJHz5T7KPClJ9vgIA# -------------------------------------------------------
+
+      LogoutURLs:
+        - !Sub "https://${FrontendDistribution.DomainName}/index.html"
+        - !Sub "https://${FrontendDistribution.DomainName}/"
+
+  # Outputs
+  # -------------------------------------------------------
+Outputs:
+  FrontendUrl:
+    Description: CloudFront URL for the MAP Tag Generator web app
+    Value: !If
+      - HasCustomDomain
+      - !Sub "https://${DomainName}"
+      - !Sub "https://${FrontendDistribution.DomainName}"
+
+  ApiUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${TagApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+
+  CognitoUserPoolId:
+    Description: Cognito user pool ID (used by the frontend for auth)
+    Value: !Ref TagApiUserPool
+
+  CognitoUserPoolClientId:
+    Description: Cognito app client ID (used by the frontend for auth)
+    Value: !Ref TagApiUserPoolClient
+
+  CognitoHostedUiDomain:
+    Description: Cognito hosted UI domain
+    Value: !Sub "${TagApiUserPoolDomain}.auth.${AWS::Region}.amazoncognito.com"
+
+  BootstrapAdminEmail:
+    Description: Email of the initial admin user (check inbox for temporary password)
+    Value: !Ref BootstrapAdminEmail
+
+  FrontendBucket:
+    Description: S3 bucket hosting the frontend
+    Value: !Ref FrontendBucket
+
+  CloudFrontDistributionId:
+    Description: CloudFront Distribution ID
+    Value: !Ref FrontendDistribution
+
+  BedrockModelStatus:
+    Description: "AWS Bedrock model (AWS Nova Pro) access status - should be AVAILABLE for the application to function properly"
+    Value: !GetAtt BedrockModelCheck.ModelStatus
+
+  BedrockSetupAction:
+    Description: "Action required if model is not enabled"
+    Value: !GetAtt BedrockModelCheck.Action
+

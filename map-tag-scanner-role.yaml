@@ -1,0 +1,65 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  MAP Tag Scanner Read-Only Role. Deploy this template in each AWS account
+  you want to scan for untagged resources. It creates a read-only IAM role
+  that the MAP Tagging Engine can assume to query AWS Config.
+
+Parameters:
+  AppAccountId:
+    Type: String
+    Description: >
+      The AWS Account ID where the MAP Tagging Engine is deployed.
+      This account's Lambda role will be trusted to assume this scanner role.
+    AllowedPattern: '^\d{12}$'
+    ConstraintDescription: Must be a 12-digit AWS Account ID.
+
+  ExternalId:
+    Type: String
+    Default: map-tag-scanner
+    Description: >
+      External ID for additional security. Must match what the app sends
+      when assuming this role. Default: map-tag-scanner
+
+Resources:
+  MapTagScannerReadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: map-tag-scanner-read-role
+      Description: >
+        Read-only role for MAP Tagging Engine to query AWS Config
+        for untagged resources. Trusted by the app account only.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AppAccountId}:root"
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref ExternalId
+      Policies:
+        - PolicyName: ConfigReadOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - config:SelectResourceConfig
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref "AWS::Region"
+
+Outputs:
+  RoleArn:
+    Description: >
+      Role ARN to use in the MAP Tagging Engine for cross-account scanning.
+      Provide this ARN in the app's "Scan Remote Account" field.
+    Value: !GetAtt MapTagScannerReadRole.Arn
+
+  Instructions:
+    Description: Setup complete
+    Value: !Sub >
+      Scanner role created. The MAP Tagging Engine in account
+      ${AppAccountId} can now scan this account for untagged resources.

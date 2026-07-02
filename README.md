@@ -26,22 +26,35 @@ A self-service serverless solution that generates correct `map-migrated` tag val
 ### Option 2: AWS CLI
 
 ```bash
-aws s3 mb s3://map-tag-deploy-$(aws sts get-caller-identity --query Account --output text)
+# Set variables
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+BUCKET_NAME="map-tag-deploy-${ACCOUNT_ID}"
+REGION="us-east-1"
 
-aws cloudformation deploy \
-  --template-file map-tagging-app-standalone.yaml \
+# Create S3 bucket for template upload (template is >51 KB)
+aws s3 mb s3://${BUCKET_NAME} --region ${REGION}
+
+# Upload template to S3
+aws s3 cp map-tagging-app-standalone.yaml s3://${BUCKET_NAME}/map-tagging-app-standalone.yaml
+
+# Deploy stack
+aws cloudformation create-stack \
   --stack-name map-tag-generator \
+  --template-url https://${BUCKET_NAME}.s3.amazonaws.com/map-tagging-app-standalone.yaml \
   --capabilities CAPABILITY_NAMED_IAM \
-  --s3-bucket map-tag-deploy-$(aws sts get-caller-identity --query Account --output text) \
-  --parameter-overrides BootstrapAdminEmail=you@example.com \
-  --region us-east-1
+  --parameters ParameterKey=BootstrapAdminEmail,ParameterValue=you@example.com \
+  --region ${REGION}
+
+# Wait for completion (~5-8 minutes)
+aws cloudformation wait stack-create-complete \
+  --stack-name map-tag-generator --region ${REGION}
 ```
 
 Get the URL:
 ```bash
 aws cloudformation describe-stacks --stack-name map-tag-generator \
   --query "Stacks[0].Outputs[?OutputKey=='FrontendUrl'].OutputValue" \
-  --output text
+  --output text --region us-east-1
 ```
 
 ## Cross-Account Scanning

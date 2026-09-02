@@ -399,7 +399,12 @@ Resources:
     Type: AWS::CloudFront::OriginAccessControl
     Properties:
       OriginAccessControlConfig:
-        Name: !Sub "${AWS::StackName}-oac"
+        # Name includes the stack's unique GUID (from StackId) so it is never reused across
+        # deploy/delete/redeploy cycles. This guarantees the OAC is always owned by this stack
+        # and is deleted with it — no orphaned OAC, no "already exists" collision.
+        Name: !Sub
+          - "${AWS::StackName}-oac-${Guid}"
+          - Guid: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
         OriginAccessControlOriginType: s3
         SigningBehavior: always
         SigningProtocol: sigv4

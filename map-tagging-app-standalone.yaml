@@ -241,7 +241,6 @@ Resources:
     Type: AWS::SQS::Queue
     # checkov:skip=CKV_AWS_27: SqsManagedSseEnabled is set to true — queue uses SQS-managed SSE encryption.
     Properties:
-      QueueName: !Sub "${AppName}-lambda-dlq"
       MessageRetentionPeriod: 1209600  # 14 days
       SqsManagedSseEnabled: true
 
@@ -290,7 +289,7 @@ Resources:
   CloudWatchLogsKeyAlias:
     Type: AWS::KMS::Alias
     Properties:
-      AliasName: !Sub "alias/${AppName}-cwlogs"
+      AliasName: !Sub "alias/${AWS::StackName}-cwlogs"
       TargetKeyId: !Ref CloudWatchLogsKey
 
   # -------------------------------------------------------
@@ -608,14 +607,13 @@ Resources:
   ApiGatewayLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub "/aws/apigateway/${AppName}-api-access-logs"
+      LogGroupName: !Sub "/aws/apigateway/${AWS::StackName}-api-access-logs"
       RetentionInDays: 30
       KmsKeyId: !GetAtt CloudWatchLogsKey.Arn
 
   ApiGatewayLoggingRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "${AppName}-apigw-logging-role"
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -745,7 +743,6 @@ Resources:
   TagGeneratorFunctionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "${AppName}-tag-generator-role"
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -760,7 +757,6 @@ Resources:
   TagGeneratorFunctionPolicy:
     Type: AWS::IAM::ManagedPolicy
     Properties:
-      ManagedPolicyName: !Sub "${AppName}-tag-generator-policy"
       Description: Permissions for the tag generator AWS Lambda (AWS Bedrock invoke + DLQ)
       PolicyDocument:
         Version: '2012-10-17'
@@ -807,7 +803,6 @@ Resources:
   ScanUntaggedFunctionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "${AppName}-scan-untagged-role"
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -862,7 +857,6 @@ Resources:
   FrontendDeployerRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "${AppName}-deployer-role"
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -877,7 +871,6 @@ Resources:
   FrontendDeployerPolicy:
     Type: AWS::IAM::ManagedPolicy
     Properties:
-      ManagedPolicyName: !Sub "${AppName}-deployer-policy"
       Description: Permissions for the frontend deployer custom resource Lambda
       PolicyDocument:
         Version: '2012-10-17'
@@ -911,7 +904,6 @@ Resources:
   TagGeneratorFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub "${AppName}-function"
       Handler: index.handler
       Runtime: python3.12
       Role: !GetAtt TagGeneratorFunctionRole.Arn
@@ -972,7 +964,6 @@ Resources:
   ScanUntaggedFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub "${AppName}-scan-untagged"
       Handler: index.handler
       Runtime: python3.12
       Role: !GetAtt ScanUntaggedFunctionRole.Arn
@@ -1092,7 +1083,6 @@ Resources:
   BedrockModelCheckerRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "${AppName}-bedrock-checker-role"
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -1107,7 +1097,6 @@ Resources:
   BedrockModelCheckerPolicy:
     Type: AWS::IAM::ManagedPolicy
     Properties:
-      ManagedPolicyName: !Sub "${AppName}-bedrock-checker-policy"
       Description: Permissions for the AWS Bedrock model agreement enabler custom resource
       PolicyDocument:
         Version: '2012-10-17'
@@ -1156,7 +1145,6 @@ Resources:
       - BedrockModelCheckerPolicy
       - BedrockModelCheckerRole
     Properties:
-      FunctionName: !Sub "${AppName}-bedrock-checker"
       Handler: index.handler
       Runtime: python3.12
       Role: !GetAtt BedrockModelCheckerRole.Arn
@@ -1230,7 +1218,6 @@ Resources:
   GetDownloadUrlFunctionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "${AppName}-get-download-url-role"
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -1245,7 +1232,6 @@ Resources:
   GetDownloadUrlFunctionPolicy:
     Type: AWS::IAM::ManagedPolicy
     Properties:
-      ManagedPolicyName: !Sub "${AppName}-get-download-url-policy"
       Description: Permissions for the pre-signed S3 URL generator Lambda
       PolicyDocument:
         Version: '2012-10-17'
@@ -1263,7 +1249,6 @@ Resources:
   GetDownloadUrlFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub "${AppName}-get-download-url"
       Handler: index.handler
       Runtime: python3.12
       Role: !GetAtt GetDownloadUrlFunctionRole.Arn
@@ -1373,7 +1358,6 @@ Resources:
   FrontendDeployerFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub "${AppName}-frontend-deployer"
       Handler: index.handler
       Runtime: python3.12
       Role: !GetAtt FrontendDeployerRole.Arn

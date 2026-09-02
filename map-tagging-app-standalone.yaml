@@ -399,7 +399,7 @@ Resources:
     Type: AWS::CloudFront::OriginAccessControl
     Properties:
       OriginAccessControlConfig:
-        Name: !Sub "${AppName}-oac"
+        Name: !Sub "${AWS::StackName}-oac"
         OriginAccessControlOriginType: s3
         SigningBehavior: always
         SigningProtocol: sigv4
@@ -893,7 +893,7 @@ Resources:
           - Effect: Allow
             Action:
               - cloudformation:GetTemplate
-            Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppName}/*"
+            Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*"
           - Effect: Allow
             Action: sqs:SendMessage
             Resource: !GetAtt LambdaDeadLetterQueue.Arn
